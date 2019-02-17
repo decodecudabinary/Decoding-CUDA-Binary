@@ -1,0 +1,17 @@
+/*! \mainpage Decoding CUDA Binary
+
+\section intro Overview
+
+The code here is what we used in our Decoding CUDA Binary paper for CGO 2019.&nbsp;<BR><BR>
+
+The decode program is the assembler generator tool.<BR>
+It can analyze binary encodings, and output bit-flipped code for more analysis, or output assembler code.<BR><BR>
+
+The asm2bin tool contains our existing assemblers, and can be used to inject bit-flipped code into executables.<BR>
+It can also change the assembly code to a more human-readable format.<BR><BR>
+
+The bin2asm tool can extract assembly code in a format our other tools understand.<BR>
+Use the -hex flag when extracting assembly for use with the decode tool, so binary is included.<BR><BR>
+
+ */
+

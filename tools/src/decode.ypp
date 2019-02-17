@@ -1,0 +1,3457 @@
+%{
+#include <fstream>
+#include <iostream>
+#include <limits.h>
+#include <sstream>
+#include <stdio.h>
+#include <string.h>
+#include "decode_common.hpp"
+#include "decode_output.hpp"
+#include "decode.hpp"
+using namespace std;
+
+//Note: if program throws "memory exhausted" error, increase YYMAXDEPTH:
+#define YYMAXDEPTH 90000
+
+int _shared_memory = -1;
+int _frame_size = -1;
+int _min_stack_size = -1;
+int _max_stack_size = -1;
+char* _kernel_name = 0;
+char** _function_names = 0;
+int _num_functions = 0;
+node * _functions = 0;
+int _arch = 0;
+int _cuobjdump_version = 0;
+
+bool i32 = false;
+bool doubled = false;
+bool doubledFirst = false;
+bool doubledSecond = false;
+int numOpsParsed;
+
+bool probe = false;
+
+int _address = 0;
+int maxregval = 63;
+int maxregbits = 6;
+#define MAX_OPERATIONS 256
+node * operations[MAX_OPERATIONS];
+
+int yylex();
+int yylex_destroy();
+void yyerror(const char * s);
+extern FILE * yyin;
+%}
+
+%error-verbose
+%union {
+		token token_;
+		node node_;
+}
+
+%token <token_> CC PR SB_OPERAND CHANNEL TEXOP GUARD MOD CONST MEMORY
+%token <token_> HEXVAL REG PREDICATE SPECIALNAME SPECIALID DECIMAL PLUSINF NEGINF BITLIST PLUSQNAN PLUSSNAN
+%token <token_> OPCODE
+%token <token_> HEXCODE
+%token <token_> SEMICOLON
+%token <token_> STRAYPIPE
+%token <token_> COMMENT METADATA_SHAREDMEM METADATA_FRAME_SIZE METADATA_MIN_STACK_SIZE METADATA_MAX_STACK_SIZE METADATA_KERNELNAME METADATA_FUNCTIONCOUNT METADATA_FUNCTIONNAME METADATA_ARCH METADATA_CUOBJDUMP
+
+%type <node_> instruction mods operand operands predicate_guard
+
+%start assemblyfile
+
+%%
+assemblyfile :	metadata assemblyfile
+	|	program
+;
+
+metadata :	METADATA_SHAREDMEM
+		{
+			_shared_memory = strtol($1.lexeme, 0, 0);
+		}
+	|	METADATA_FRAME_SIZE
+		{
+			_frame_size = strtol($1.lexeme, 0, 0);
+		}
+	|	METADATA_MIN_STACK_SIZE
+		{
+			_min_stack_size = strtol($1.lexeme, 0, 0);
+		}
+	|	METADATA_MAX_STACK_SIZE
+		{
+			_max_stack_size = strtol($1.lexeme, 0, 0);
+		}
+	|	METADATA_KERNELNAME
+		{
+			_kernel_name = $1.lexeme;
+		}
+	|	METADATA_FUNCTIONCOUNT
+		{
+			_function_names = (char**) malloc(strtol($1.lexeme, 0, 0) * sizeof(char*));
+		}
+	|	METADATA_FUNCTIONNAME
+		{
+			_function_names[_num_functions] = $1.lexeme;
+			_num_functions++;
+		}
+	|	METADATA_ARCH
+		{
+			if(_arch != 0) {
+				int temp = atoi($1.lexeme);
+				if (temp != _arch) {
+					cerr << "WARNING: architecture mismatch between assembly code and persistent data.\n";
+				}
+				_arch = temp;
+			} else {
+				_arch = atoi($1.lexeme);
+			}
+			if(_arch >= 35) {
+				maxregval = 255;
+				maxregbits = 8;
+			}
+		}
+	|	METADATA_CUOBJDUMP
+		{
+			_cuobjdump_version = atoi($1.lexeme);
+		}
+;
+
+program :	statement SEMICOLON
+	|	statement SEMICOLON {_address += 8;} program
+;
+
+statement	:	HEXCODE
+			predicate_guard
+			instruction
+			{
+				instruction * i = (instruction*) $3.value;
+				i->guard = (operand*) $2.value;
+				i->address = _address;
+				analyze(i, $1.lexeme);
+			}
+		|	HEXCODE
+			instruction
+			{
+				instruction * i = (instruction*) $2.value;
+				i->address = _address;
+				analyze(i, $1.lexeme);
+			}
+;
+
+predicate_guard	:	GUARD operand
+			{
+				//Make sure operand is a predicate:
+				if(((operand*)$2.value)->type != type_predicate) {
+					cerr << "SANITY CHECK FAILED: guarded non-predicate.\n";
+					cerr << "\tThis error means an nonsensical predicate guard was used, such as @[R1+0x4]\n";
+				}
+				
+				$$ = $2;
+			}
+;
+
+mods	:	MOD mods
+		{
+			//Store MOD's text for use by the associated instruction
+			node * first = (node*) malloc(sizeof(node));
+			first->value = $1.lexeme;
+			first->next = $2.next;
+			$$.next = first;
+		}
+	|	STRAYPIPE mods {$$.next = $2.next;}
+	|	/* empty */ {$$.next = 0;}
+;
+
+operand	:	REG
+		{
+			//Setup for register operand:
+			unsigned long long val1 = -1;
+			operand_prop props = (operand_prop) 0;
+			
+			//Loop to find the register's value, and any unary operations:
+			int len = strlen($1.lexeme);
+			int x;
+			for(x = 0; x < len; x++) {
+				if($1.lexeme[x] == '|') {
+					props = props | prop_absolute_value;
+				} else if($1.lexeme[x] == '-') {
+					props = props | prop_minus;
+				} else if($1.lexeme[x] == '~') {
+					props = props | prop_bitwise_complement;
+				} else if($1.lexeme[x] == '!') {
+					props = props | prop_not;
+				} else if($1.lexeme[x] == 'R') {
+					if($1.lexeme[x+1] == 'Z') {//zero register RZ
+						val1 = -1;
+						x++;
+					} else {
+						val1 = atoi($1.lexeme+x+1);
+						x++;
+						if(val1 > 9) {
+							x++;
+						}
+						if(val1 > 99) {
+							x++;
+						}
+						if(val1 > 999) {
+							x++;
+						}
+					}
+				} else {
+					cerr << "WARNING: unrecognized character '" << $1.lexeme[x] << "' in register operand.\n";
+					cerr << "\tThis warning may mean that the assembly format has changed.\n";
+				}
+			}
+			
+			$$.value = newOperand(type_register, props, val1, 0, 0);
+		}
+	|	MEMORY
+		{
+			//Setup for memory-address operand
+			unsigned long long val1 = -1;
+			int val2 = 0;
+			operand_prop props = (operand_prop) 0;
+			
+			//Loop to find values of the operand's components, and any unary operations:
+			int len = strlen($1.lexeme) - 1;
+			int x;
+			char seenBracket = 0;
+			char negateOffset = 0;//set to true iff the constant offset is a negative number
+			for(x = 0; x < len; x++) {
+				if($1.lexeme[x] == '|') {
+					props = props | prop_absolute_value;
+				} else if($1.lexeme[x] == '-') {
+					if(seenBracket) {
+						negateOffset = 1;
+					}
+					else {
+						props = props | prop_minus;
+					}
+				} else if($1.lexeme[x] == '~') {
+					props = props | prop_bitwise_complement;
+				} else if($1.lexeme[x] == '!') {
+					props = props | prop_not;
+				} else if($1.lexeme[x] == '[') {
+					seenBracket = 1;
+				} else if($1.lexeme[x] == 'R') {
+					if($1.lexeme[x+1] == 'Z') {//zero register RZ
+						val1 = -1;
+					}
+					else {
+						val1 = atoi($1.lexeme+x+1);
+					}
+					x += 2;
+				} else if($1.lexeme[x] == 'x') {
+					val2 = strtoul($1.lexeme + x + 1, NULL, 16);
+					if(negateOffset) {//the offset is negative
+						val2 = -val2;
+					}
+				}
+			}
+			
+			$$.value = newOperand(type_mem, props, val1, val2, 0);
+		}
+	|	CONST
+		{
+			//Setup for constant-memory-address operand
+			unsigned long long val1 = -1;
+			int val2 = 0;
+			int val3 = 0;
+			operand_prop props = (operand_prop) 0;
+			
+			//Loop to find values of the operand's components, and any unary operations:
+			int len = strlen($1.lexeme) - 1;
+			char second = 0;
+			int x;
+			char negateOffset = 0;//set to true iff the constant offset is a negative number
+			char seenBracket = 0;
+			for(x = 0; x < len; x++) {
+				if($1.lexeme[x] == '|') {
+					props = props | prop_absolute_value;
+				}
+				else if($1.lexeme[x] == '-') {
+					if(seenBracket) {
+						if(second) {
+							negateOffset = 1;
+						} else {
+							fprintf(stderr,"SANITY CHECK FAILED ~341: negative memory bank?\n");
+						}
+					} else {
+						props = props | prop_minus;
+					}
+				} else if($1.lexeme[x] == '~') {
+					props = props | prop_bitwise_complement;
+				} else if($1.lexeme[x] == '!') {
+					props = props | prop_not;
+				}
+				
+				else if($1.lexeme[x] == '[') {
+					seenBracket = 1;
+				} else if($1.lexeme[x] == 'R') {
+					if($1.lexeme[x+1] == 'Z') {//zero register RZ
+						val1 = -1;
+					}
+					else {
+						val1 = atoi($1.lexeme + x + 1);
+					}
+					x += 2;
+				} else if($1.lexeme[x] == 'x') {
+					if(second) {
+						val3 = strtoul($1.lexeme + x + 1, NULL, 16);
+						if(negateOffset) {
+							val3 = -val3;
+						}
+					} else {
+						val2 = strtoul($1.lexeme + x + 1, NULL, 16);
+					}
+				} else if($1.lexeme[x] == ']') {
+					second = 1;
+				}
+			}
+			
+			$$.value = newOperand(type_const_mem, props, val1, val2, val3);
+		}
+	|	SPECIALNAME
+		{
+			//Special-register operand (by name)
+			int sid = getSpecialID($1.lexeme+3, true, _arch);
+			operand * op = newOperand(type_special_reg, sid);
+			if(sid < 0) {
+				op->bad = true;
+			}
+			$$.value = op;
+			
+		}
+	|	SPECIALID
+		{
+			//Special-register operand (by id)
+			$$.value = newOperand(type_special_reg, atoi($1.lexeme+2));
+		}
+	|	PREDICATE
+		{
+			//Setup for predicate operand
+			unsigned long long val1 = 7;
+			operand_prop props = (operand_prop) 0;
+			
+			//Loop to find predicate's value, and any unary operations:
+			int len = strlen($1.lexeme);
+			int x;
+			for(x = 0; x < len; x++) {
+				if($1.lexeme[x] == '|') {
+					props = props | prop_absolute_value;
+				} else if($1.lexeme[x] == '-') {
+					props = props | prop_minus;
+				} else if($1.lexeme[x] == '~') {
+					props = props | prop_bitwise_complement;
+				} else if($1.lexeme[x] == '!') {
+					props = props | prop_not;
+				} else if($1.lexeme[x] == 'P') {
+					if($1.lexeme[x+1] == 't' || $1.lexeme[x+1] == 'T') {//null predicate pt
+						val1 = 7;
+					}
+					else {
+						val1 = atoi($1.lexeme+x+1);
+					}
+				} else if($1.lexeme[x] == 'p' && $1.lexeme[x+1] == 't') {//null predicate pt
+					val1 = 7;
+				}
+			}
+			
+			$$.value = newOperand(type_predicate, props, val1, 0, 0);
+		}
+	|	HEXVAL
+		{
+			//Setup for hex operand
+			unsigned long long val1 = -1;
+			operand_prop props = (operand_prop) 0;
+			
+			//Loop to find hex value, and any unary operations:
+			int len = strlen($1.lexeme);
+			for(int x = 0; x < len; x++) {
+				if($1.lexeme[x] == '|') {
+					props = props | prop_absolute_value;
+				} else if($1.lexeme[x] == '-') {
+					props = props | prop_minus;
+				} else if($1.lexeme[x] == '~') {
+					props = props | prop_bitwise_complement;
+				} else if($1.lexeme[x] == '!') {
+					props = props | prop_not;
+				} else if($1.lexeme[x] == 'x') {
+					val1 = strtoul($1.lexeme + x + 1, NULL, 16);
+				}
+			}
+			
+			$$.value = newOperand(type_hex, props, val1, 0, 0);
+		}
+	|	BITLIST
+		{
+			//Setup for bit_list operand
+			long long val1 = 0;
+			
+			//Loop to find bit IDs:
+			int len = strlen($1.lexeme);
+			for(int x = 0; x < len; x++) {
+				if($1.lexeme[x] >= '0' && $1.lexeme[x] <= '9') {
+					int bit = atoi($1.lexeme + x);
+					val1 |= (0x1 << bit);
+					
+					while($1.lexeme[x] >= '0' && $1.lexeme[x] <= '9') {
+						x++;
+					}
+					x--;
+				} else {
+				
+				}
+			}
+			
+			operand * op = newOperand(type_bit_list, (operand_prop) 0, val1, 0, 0);;
+			$$.value = op;
+		}
+	|	DECIMAL//base-10 integer and floats shows up instead of pure hex values starting in CUDA SDK 5.5
+		{
+			//Setup for hex operand
+			unsigned long long val1;
+			float fval;
+			double dval;
+			operand_prop props = (operand_prop) 0;
+			
+			bool doubleMe = (doubled || (numOpsParsed == 0 && doubledFirst) || (numOpsParsed == 1 && doubledSecond));
+			
+			if(doubleMe) {
+				dval = atof($1.lexeme);
+				char * temp = (char*) &dval;
+				unsigned long long * temp2 = (unsigned long long *)temp;
+				val1 = *temp2;
+				val1 = val1 >> 32;
+			} else {
+				fval = atof($1.lexeme);
+				char * temp = (char*) &fval;
+				unsigned int * temp2 = (unsigned int *)temp;
+				val1 = *temp2;
+			}
+			if(!i32) {
+				if(!doubleMe && (_arch > 30 && _arch < 50) && (val1 & 0xfff)) {//I have no idea why this is necessary
+					val1 = val1 >> 11;
+					val1 &= 0x7ff;
+				} else {
+					val1 = val1 >> 12;
+				}
+			}
+			
+			operand * op = newOperand(type_hex, props, val1, 0, 0);
+			op->decimal = true;
+			
+			for(unsigned int x = 0; x < strlen($1.lexeme); x++) {
+				if($1.lexeme[x] == '-') {
+					op->properties = op->properties | prop_minus;
+				} else if($1.lexeme[x] == 'e' || $1.lexeme[x] == 'E') {
+					break;
+				}
+			}
+				
+			$$.value = op;
+		}
+	|	PLUSINF
+		{
+			unsigned long long val1	= 0x7f80000000000000LL;
+			if(doubled || (numOpsParsed == 0 && doubledFirst) || (numOpsParsed == 1 && doubledSecond)) {
+				val1 = 0x7ff0000000000000LL;
+			}
+			if(!i32) {
+				val1 = val1 >> 12;
+			}
+			
+			val1 = val1 >> 32;
+			
+			operand * op = newOperand(type_hex, (operand_prop)0, val1, 0, 0);
+			op->decimal = true;
+			$$.value = op;
+		}
+	|	NEGINF
+		{
+			unsigned long long val1 = 0xff80000000000000LL;
+			if(doubled || (numOpsParsed == 0 && doubledFirst) || (numOpsParsed == 1 && doubledSecond)) {
+				val1 = 0xfff0000000000000LL;
+			}
+			if(!i32) {
+				val1 = val1 >> 12;
+			}
+			
+			val1 = val1 >> 32;
+			
+			operand * op = newOperand(type_hex, (operand_prop)0, val1, 0, 0);
+			op->properties = op->properties | prop_minus;
+			op->decimal = true;
+			$$.value = op;
+		}
+	|	PLUSSNAN
+		{
+			unsigned long long val1 = 0x7f80020000000000LL;//TODO: verify correctness
+			if(doubled || (numOpsParsed == 0 && doubledFirst) || (numOpsParsed == 1 && doubledSecond)) {
+				val1 = 0x7ff0020000000000LL;//TODO: verify correctness
+			}
+			val1 = val1 >> 32;
+			if(!i32) {
+				val1 = val1 >> 12;
+			}
+			operand * op = newOperand(type_hex, (operand_prop)0, val1, 0, 0);
+			op->decimal = true;
+			op->bad = true;
+			$$.value = op;
+		}
+	|	PLUSQNAN
+		{
+			unsigned long long val1 = 0x7fc0000000000000LL;//TODO: verify correctness
+			if(doubled || (numOpsParsed == 0 && doubledFirst) || (numOpsParsed == 1 && doubledSecond)) {
+				val1 = 0x7ff8000000000000LL;//TODO: verify correctness
+			}
+			val1 = val1 >> 32;
+			if(!i32) {
+				val1 = val1 >> 12;
+			}
+			operand * op = newOperand(type_hex, (operand_prop)0, val1, 0, 0);
+			op->decimal = true;
+			op->bad = true;
+			$$.value = op;
+		}
+	|	CC
+		{
+			//Weird operand
+			$$.value = newOperand(type_other_operand, getOtherID("CC"));
+		}
+	|	PR
+		{
+			//Weird operand (some sort of special predicate?)
+			$$.value = newOperand(type_other_operand, getOtherID("PR"));
+		}
+	|	SB_OPERAND
+		{
+			//Weird operand (used in DEPBAR on sm_50)
+			$$.value = newOperand(type_sb, atoi($1.lexeme));
+		}
+	|	CHANNEL
+		{
+			//Color channel operand, e.g. R, RGBA, A, or etcetera (used in TLDS, TEXS in sm_50)
+			$$.value = newOperand(type_channel, getChannelID($1.lexeme));
+		}
+	|	TEXOP
+		{
+			//Texture operand
+			$$.value = newOperand(type_texture_operand, getTextureID($1.lexeme));
+		}
+;
+
+operands	:	operand mods {numOpsParsed++;} operands
+			{
+				//Setup operand:
+				operand * o = (operand*) $1.value;
+				o->mods = $2.next;
+				
+				//Add operand to list of operands for instruction:
+				node * first = (node*) malloc(sizeof(node));
+				first->value = o;
+				first->next = $4.next;
+				
+				//Put operand list into $$.next for the instruction to find
+				$$.next = first;
+			}
+		|	/*empty*/ {$$.next = 0;}
+;
+
+instruction:	OPCODE mods
+		{
+			doubled = ($1.lexeme[0] == 'D');
+			i32 = false;
+			int len = strlen($1.lexeme);
+			if(len > 3) {
+				if(!strcmp($1.lexeme + len - 3, "32I")) { //TODO: test this for correctness
+					i32 = true;
+				}
+			}
+			
+			opcode opc = (opcode)getOpcode($1.lexeme);
+			doubledFirst = false;
+			doubledSecond = false;
+			bool seenType = false;
+			numOpsParsed = 0;
+			if(opc == opcode_F2F || opc == opcode_F2I || opc == opcode_I2F) {
+				node * mods = $2.next;
+				while(mods) {
+					char * mod = (char *) mods->value;
+					if(getModType(mod) == MOD_TYPE) {
+						if(!strcmp(mod, "F64")) {
+							if(seenType) {
+								doubledSecond = true;
+							} else {
+								doubledFirst = true;
+							}
+						}
+						seenType = true;
+					}
+					mods = mods->next;
+				}
+			}
+		}
+		operands
+		{
+			instruction * inst = newInstruction((opcode)getOpcode($1.lexeme), $2.next, $4.next);
+			if(inst->op == opcode_TEX) {
+				for(int x = 0; x < inst->num_operands; x++) {
+					if(inst->operands[x]->type == type_hex) {
+						if(inst->operands[x]->val1 == 0) {
+							inst->operands[x]->bad = true;
+						}
+					}
+				}
+			}
+			$$.value = inst;
+		}
+;
+
+%%
+
+void yyerror(const char* s) {
+	fprintf(stderr,"%s\n",s);
+}
+
+/**
+ * Returns modifier type for a given modifier string.
+ * Note that we decided the types manually based on our observations.
+ * @param modstr The modifier string
+ * @return the modifier's type
+ */
+int getModType(const char * modstr) {
+	int type = MOD_FLAG;
+	if(!strcmp(modstr, "AND")) {
+		type = MOD_PROPOSITION;
+	} else if(!strcmp(modstr, "OR")) {
+		type = MOD_PROPOSITION;
+	} else if(!strcmp(modstr, "XOR")) {
+		type = MOD_PROPOSITION;
+	} else if(!strcmp(modstr, "PASS_B")) {
+		type = MOD_PROPOSITION;
+	} else if(!strcmp(modstr, "U32")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "S32")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "U64")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "S64")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "U16")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "S16")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "U8")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "S8")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "F32")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "F64")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "F16")) {
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "INVALIDSEL7")) { //vabsdiff
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "INVALIDFPSRC0")) { //i2f
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "INVALIDFPDEST0")) { //f2f
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "INVALID7")) { //i2i
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "INVALID0")) { //f2i
+		type = MOD_TYPE;
+	} else if(!strcmp(modstr, "F")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "LT")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "EQ")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "LE")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "GT")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "NE")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "GE")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "NUM")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "NAN")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "LTU")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "EQU")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "LEU")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "GTU")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "NEU")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "GEU")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "T")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "OFF")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "LO")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "SFF")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "LS")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "HI")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "SFT")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "HS")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "OFT")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "CSM_TA")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "CSM_TR")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "CSM_MX")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "FCSM_TA")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "FCSM_TR")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "FCSM_MX")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "RLE")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "RGT")) {
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "NZ")) {//lop
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "Z")) {//lop
+		type = MOD_COMPARE;
+	} else if(!strcmp(modstr, "RN")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "RZ")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "RM")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "RP")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "RNI")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "RZI")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "RMI")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "RPI")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "FLOOR")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "ROUND")) { //not sure about this one
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "PASS")) { //not sure about this one
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "CEIL")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "TRUNC")) {
+		type = MOD_ROUND;
+	} else if(!strcmp(modstr, "L")) {
+		type = MOD_SHIFTDIRECTION;
+	} else if(!strcmp(modstr, "R")) {
+		type = MOD_SHIFTDIRECTION;
+	} else if(strstr(modstr, "INVALIDCHKMODE") == modstr) {
+		type = MOD_INVALIDCHKMODE;
+	} else if(!strcmp(modstr, "RS")) {
+		type = MOD_IADD3;
+	} else if(!strcmp(modstr, "LS")) {
+		type = MOD_IADD3;
+	} else if(!strcmp(modstr, "???3")) {
+		type = MOD_IADD3;
+	} else if(!strcmp(modstr, "COS")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "SIN")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "EX2")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "LG2")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "RCP")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "RSQ")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "RCP64H")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "RSQ64H")) {
+		type = MOD_MUFU;
+	} else if(!strcmp(modstr, "MRG")) {
+		type = MOD_XMAD;
+	} else if(!strcmp(modstr, "PSL")) {
+		type = MOD_XMAD;
+	} else if(!strcmp(modstr, "CHI")) {
+		type = MOD_XMAD;
+	} else if(!strcmp(modstr, "CLO")) {
+		type = MOD_XMAD;
+	} else if(!strcmp(modstr, "CSFU")) {
+		type = MOD_XMAD;
+	} else if(!strcmp(modstr, "XLO")) {
+		type = MOD_IMNMX;
+	} else if(!strcmp(modstr, "XMED")) {
+		type = MOD_IMNMX;
+	} else if(!strcmp(modstr, "XHI")) {
+		type = MOD_IMNMX;
+	} else if(!strcmp(modstr, "FTZ")) {
+		type = MOD_FTZ;
+	} else if(!strcmp(modstr, "INVALIDFMZ3")) {
+		type = MOD_FTZ;
+	} else if(!strcmp(modstr, "INVALIDFMZ1")) {//haven't seen this, but it might exist
+		type = MOD_FTZ;
+	} else if(!strcmp(modstr, "INVALIDFMZ2")) {//haven't seen this, but it might exist
+		type = MOD_FTZ;
+	} else if(!strcmp(modstr, "INVALIDFMZ0")) {//haven't seen this, but it might exist
+		type = MOD_FTZ;
+	}
+	return type;
+}
+
+int getOpcode(const char * opname) {
+	int x = 0;
+	while(opcodes[x]) {
+		if(!strcmp(opcodes[x], opname)) {
+			return x;
+		}
+		x++;
+	}
+	
+	// fprintf(stderr, "ERROR: Unrecognized opcode %s.\n", opname);
+	return -1;
+}
+
+/**
+ * Retrieves known encodings for modifier attached to opcode.
+ * @param op The operation
+ * @param modstr The modifier string
+ * @param seenSameType True iff this is the second modifier of its type
+ * return The modifier's encoding info, or NULL if not found.
+ */
+operationMod * hasMod(operation * op, const char * modstr, bool seenSameType) {
+	int type = getModType(modstr);
+	node * iter = op->mods;
+	while(iter) {
+		operationMod * mod = (operationMod*) iter->value;
+		if(!type || (type == mod->type && ((seenSameType && mod->count == 1) || (!seenSameType && !mod->count)))) {
+			if(!strcmp(modstr, mod->token)) {
+				return mod;
+			}
+		}
+		iter = iter->next;
+	}
+	
+	return 0;
+}
+
+/**
+ * Adds initial encodings for previously-unknown modifier attached to opcode.
+ * @param op The operation
+ * @param modstr The modifier string
+ * @param seenSameType True iff this is the second modifier of its type
+ * @param binary The binary code for the instruction when this modifier was seen.
+ * return The modifier's encoding info
+ */
+operationMod * addMod(operation * op, const char * modstr, bool seenSameType, bool * binary) {
+	int type = getModType(modstr);
+	
+	operationMod * mod = (operationMod*) malloc(sizeof(operationMod));
+	//mod->combine = true;
+	mod->combine = false;
+	mod->type = type;
+	mod->token = (char*) malloc(strlen(modstr) + 1);
+	strcpy(mod->token, modstr);
+	mod->seenAntiVal = false;
+	if(binary) {
+		for(int x = 0; x < 64; x++) {
+			mod->vals[x] = binary[x];
+			mod->matters[x] = true;
+			mod->antivals[x] = !binary[x];
+		}
+	}
+	if(type && seenSameType) {
+		mod->count = 1;
+	} else {
+		mod->count = 0;
+	}
+	
+	addLast(&op->mods, mod);
+	return mod;
+}
+
+/**
+ * Retrieves known encodings for modifier attached to an operand.
+ * (We don't check mod order here, because we've never seen multiple typed-modifiers attached to operands.)
+ * @param op The operand
+ * @param modstr The modifier string
+ * return The modifier's encoding info, or NULL if not found.
+ */
+operationMod * hasMod(operationOperand * op, const char * modstr) {
+	node * iter = op->mods;
+	while(iter) {
+		operationMod * mod = (operationMod*) iter->value;
+		if(!strcmp(modstr, mod->token)) {
+			return mod;
+		}
+		iter = iter->next;
+	}
+	
+	return 0;
+}
+
+/**
+ * Adds initial encodings for previously-unknown modifier attached to operand.
+ * (We don't check mod order here, because we've never seen multiple typed-modifiers attached to operands.)
+ * @param op The operand
+ * @param modstr The modifier string
+ * @param binary The binary code for the instruction when this modifier was seen.
+ * return The modifier's encoding info
+ */
+operationMod * addMod(operationOperand * op, const char * modstr, bool * binary) {
+	operationMod * mod = (operationMod*) malloc(sizeof(operationMod));
+	//mod->combine = true;
+	mod->combine = false;
+	mod->type = getModType(modstr);
+	mod->token = (char*) malloc(strlen(modstr) + 1);
+	strcpy(mod->token, modstr);
+	mod->seenAntiVal = false;
+	if(binary) {
+		for(int x = 0; x < 64; x++) {
+			mod->vals[x] = binary[x];
+			mod->matters[x] = true;
+			mod->antivals[x] = !binary[x];
+		}
+	}
+	mod->count = 0;
+	
+	addLast(&op->mods, mod);
+	return mod;
+}
+
+/**
+ * Converts a string of hexadecimal characters to an array of booleans.
+ * @param hexstring A string of 16 hex chars.
+ * @return A boolean array of size 64.
+ */
+bool * hextobool(char * hexstring) {
+	bool * hex = (bool*) malloc(sizeof(bool) * 64);
+	
+	if(_cuobjdump_version < 55) {
+		cerr << "ERROR py~590: unimplemented.\n";
+		cerr << "\tThis program has not been tested with CUDA Toolkit versions prior to 5.5.\n";
+	}
+	
+	for(int x = 0; x < 16; x++) {
+		int index = 63 - (4*x);
+		switch(hexstring[x]) {
+			case '0':
+				hex[index-0] = false;
+				hex[index-1] = false;
+				hex[index-2] = false;
+				hex[index-3] = false;
+				break;
+			case '1':
+				hex[index-0] = false;
+				hex[index-1] = false;
+				hex[index-2] = false;
+				hex[index-3] = true;
+				break;
+			case '2':
+				hex[index-0] = false;
+				hex[index-1] = false;
+				hex[index-2] = true;
+				hex[index-3] = false;
+				break;
+			case '3':
+				hex[index-0] = false;
+				hex[index-1] = false;
+				hex[index-2] = true;
+				hex[index-3] = true;
+				break;
+			case '4':
+				hex[index-0] = false;
+				hex[index-1] = true;
+				hex[index-2] = false;
+				hex[index-3] = false;
+				break;
+			case '5':
+				hex[index-0] = false;
+				hex[index-1] = true;
+				hex[index-2] = false;
+				hex[index-3] = true;
+				break;
+			case '6':
+				hex[index-0] = false;
+				hex[index-1] = true;
+				hex[index-2] = true;
+				hex[index-3] = false;
+				break;
+			case '7':
+				hex[index-0] = false;
+				hex[index-1] = true;
+				hex[index-2] = true;
+				hex[index-3] = true;
+				break;
+			case '8':
+				hex[index-0] = true;
+				hex[index-1] = false;
+				hex[index-2] = false;
+				hex[index-3] = false;
+				break;
+			case '9':
+				hex[index-0] = true;
+				hex[index-1] = false;
+				hex[index-2] = false;
+				hex[index-3] = true;
+				break;
+			case 'A':
+			case 'a':
+				hex[index-0] = true;
+				hex[index-1] = false;
+				hex[index-2] = true;
+				hex[index-3] = false;
+				break;
+			case 'B':
+			case 'b':
+				hex[index-0] = true;
+				hex[index-1] = false;
+				hex[index-2] = true;
+				hex[index-3] = true;
+				break;
+			case 'C':
+			case 'c':
+				hex[index-0] = true;
+				hex[index-1] = true;
+				hex[index-2] = false;
+				hex[index-3] = false;
+				break;
+			case 'D':
+			case 'd':
+				hex[index-0] = true;
+				hex[index-1] = true;
+				hex[index-2] = false;
+				hex[index-3] = true;
+				break;
+			case 'E':
+			case 'e':
+				hex[index-0] = true;
+				hex[index-1] = true;
+				hex[index-2] = true;
+				hex[index-3] = false;
+				break;
+			case 'F':
+			case 'f':
+				hex[index-0] = true;
+				hex[index-1] = true;
+				hex[index-2] = true;
+				hex[index-3] = true;
+				break;
+			default:
+				//cerr << hexstring[x] << "\n";
+				cerr << "ERROR py~692: invalid character found in hexadecimal string\n";
+		}
+	}
+	
+	return hex;
+}
+
+/**
+ * Gets the max number of matching bits for a given operand component at a given location.
+ * @param hex The instruction's binary
+ * @param index The location of the lowest bit being considered.
+ * @param inst The instruction's assembly
+ * @param opid Which operand we're considering
+ * @param compid Which component of the operand we're considering
+ * @param info A bitfield of special info for hex literals. This function sets info&0x2 for relative addresses, info&0x2 for bit-shifted constant memory bank, info&0x4 for special handling of arithmetic negation.
+ * @return largest number of bits at given location that hold the expected value.
+ */
+int getMaxOperandBits(bool * hex, int index, instruction * inst, int opid, int compid, int & info) {
+	int max = 64 - index;
+	if(max > 32) {
+		max = 32;
+	}
+	int min = 1;
+	int altmin = 0;
+	int addr = inst->address;
+	long long val = 0;
+	unsigned long long altval = 0;//checks val-addr-8 in case of relative addresses on hex value
+	long long altval2 = 0;//checks -1*val in case of non-standard negative property on hex literal
+	info = 0x7;
+	operand * op = inst->operands[opid];
+	
+	if(compid == 1) {
+		val = op->val1;
+		altval = val;
+		if(inst->operands[opid]->type == type_register || inst->operands[opid]->type == type_mem || inst->operands[opid]->type == type_const_mem) {
+			min = maxregbits;
+			if(op->reg < 0) {
+				val = maxregval;
+				altval = val;
+			}
+		} else if(inst->operands[opid]->type == type_special_reg) {
+			min = maxregbits;
+		} else if(inst->operands[opid]->type == type_predicate) {
+			min = 3;
+		} else if(inst->operands[opid]->type == type_hex) {
+			min = 4;
+			altmin = 20;
+			if(inst->operands[opid]->properties & prop_minus) {
+				altval = (-val - addr - 0x8);
+			} else {
+				altval = val - addr - 0x8;
+			}
+			if(inst->operands[opid]->decimal) {
+				altval2 = val;
+			} else {
+				altval2 = -val;
+			}
+			
+			int realMin = 0;
+			for(int x = 20; x >= 1; x--) {
+				if((val >> x) & 1) {
+					realMin = x;
+					break;
+				}
+			}
+			if(realMin > min) {
+				min = realMin;
+			}
+		} else if(inst->operands[opid]->type == type_channel) {
+			min = 3;
+		}
+	} else if(compid == 2) {
+		val = op->val2;
+		altval = val;
+		min = 4;
+	} else if(compid == 3) {
+		val = op->val3;
+		if(!(val & 1) && !(val & 2)) {
+			altval = val >> 2;
+			min = 14;
+		} else {
+			altval = val;
+			min = 16;
+		}
+	} else {
+		cerr << "SANITY CHECK ERROR py~741.\n";
+		cerr << "\tSomehow the operand has more components than is possible.\n";
+		exit(0);
+	}
+	
+	if(max < min) {
+		return 0;
+	}
+	
+	if(!altmin) {
+		altmin = min;
+	}
+	
+	int tempmax = 0;
+	bool goodval = true;
+	bool goodalt = true;
+	bool goodalt2 = (altval2 != 0);
+	while(tempmax < max) {
+		if(goodval) {
+			if(hex[index + tempmax] != ((val & 0x1) == 1)) {
+				goodval = false;
+			}
+		}
+		if(goodalt) {
+			if(hex[index + tempmax] != ((altval & 0x1) == 1)) {
+				goodalt = false;
+			}
+		}
+		if(goodalt2) {
+			if(inst->operands[opid]->decimal) {
+				if(val == 0 && !goodval) {
+					goodalt2 = true;
+				} else {
+					goodalt2 = false;
+				}
+			}
+			if(hex[index + tempmax] != ((altval2 & 0x1) == 1)) {
+				goodalt2 = false;
+			}
+		}
+		
+		val = val >> 1;
+		altval = altval >> 1;
+		altval2 = altval2 >> 1;
+		
+		if(tempmax < min) {
+			if(!goodval) {
+				info &= 0x6;
+			}
+			if(!goodalt) {
+				info &= 0x5;
+			}
+			if(!goodalt2) {
+				info &= 0x3;
+			}
+		}
+		if(tempmax < altmin) {
+			if(!goodalt) {
+				info &= 0x5;
+			}
+		}
+		
+		if(!goodval && !goodalt && !goodalt2) {
+			break;
+		}
+		
+		tempmax++;
+		
+		if(inst->operands[opid]->decimal && !goodval && goodalt2) {
+			break;
+		}
+	}
+	
+	if(tempmax < min) {
+		return 0;
+	}
+	
+	if(!info) {
+		return 0;
+	}
+	
+	return tempmax;
+}
+
+/**
+ * Checks assembly code for modifier attached to opcode.
+ * @param inst The assembly code for an instruction
+ * @param mod The modifier string
+ * @return True iff mod is attached to the opcode
+ */
+bool hasMod(instruction* inst, const char* mod) {
+	node * n = inst->mods;
+	while(n) {
+		if(!strcmp((char*)n->value, mod)) {
+			return true;
+		}
+		n = n->next;
+	}
+	
+	return false;
+}
+
+/**
+ * Checks assembly code for modifier attached to operand.
+ * @param inst The assembly code for the operand
+ * @param mod The modifier string
+ * @return True iff mod is attached to the operand
+ */
+bool hasMod(operand* op, const char* mod) {
+	node * n = op->mods;
+	while(n) {
+		if(!strcmp((char*)n->value, mod)) {
+			return true;
+		}
+		n = n->next;
+	}
+	
+	return false;
+}
+
+/**
+ * Analyzes an instruction, and updates its encodings in the operation list.
+ * @param inst The assembly code
+ * @param hexstring The binary code
+ */
+void analyze(instruction * inst, char * hexstring) {
+	int guardLoc;
+	if(_arch <= 30) {
+		cerr << "FATAL ERROR: still need add basic handling for this architecture.\n";
+		exit(0);
+	} else if((_arch > 30 && _arch < 50)) {
+		guardLoc = 18;
+	} else if((_arch >= 50 && _arch < 70)) {
+		guardLoc = 16;
+	} else {
+		cerr << "FATAL ERROR: Unimplemented architecture;\n";
+		cerr << "\tNeed to set predicate guard location, etcetera.\n";
+		exit(0);
+	}
+	
+	if(inst->op < 0) {
+		return;
+	}
+	
+	bool * hex = hextobool(hexstring);
+	
+	operation * op = 0;
+	node * iter = operations[inst->op];
+	while(iter && !op) {
+		operation * temp = (operation*) iter->value;
+		if(temp->numOperands == inst->num_operands) {
+			op = temp;
+			for(int x = 0; x < temp->numOperands; x++) {
+				if(temp->operands[x]->type != inst->operands[x]->type) {
+					op = 0;
+					break;
+				}
+			}
+		}
+		iter = iter->next;
+	}
+	
+	bool newOperation = false;
+	if(!op) {
+		newOperation = true;
+		op = (operation*) malloc(sizeof(operation));
+		for(int x = 0; x < 8; x++) {
+			op->operands[x] = 0;
+			op->mods = 0;
+		}
+		
+		for(int y = 1; y < NUM_MOD_TYPES; y++) {
+			for(int z = 0; z < 64; z++) {
+				op->noModBits[y][z] = true;
+			}
+		}
+		
+		op->confirmedGuard = inst->guard;
+		op->op = inst->op;
+		for(int x = 0; x < 64; x++) {
+			op->binidmatters[x] = true;
+			op->binid[x] = hex[x];
+		}
+		
+		bool seen[NUM_MOD_TYPES];
+		for(int x = 0; x < NUM_MOD_TYPES; x++) {
+			seen[x] = false;
+		}
+		
+		node * iter = inst->mods;
+		while(iter) {
+			char * modstr = (char*) iter->value;
+			operationMod * mod = addMod(op, modstr, seen[getModType(modstr)], hex);
+			for(int y = 0; y < 64; y++) {
+				mod->matters[y] = true;
+				mod->vals[y] = hex[y];
+				mod->antivals[y] = !hex[y];
+			}
+			if(mod->type > 0) {
+				seen[mod->type] = true;
+			}
+			iter = iter->next;
+		}
+		
+		op->numOperands = inst->num_operands;
+		for(int x = 0; x < inst->num_operands; x++) {
+			op->operands[x] = (operationOperand*) malloc(sizeof(operationOperand));
+			op->operands[x]->decimal = inst->operands[x]->decimal;
+			op->operands[x]->relative = false;
+			op->operands[x]->incNegative = false;
+			op->operands[x]->addlNegative = false;
+			op->operands[x]->shiftComp3 = false;
+			op->operands[x]->type = inst->operands[x]->type;
+			op->operands[x]->mods = 0;
+			
+			op->operands[x]->components = 0;
+			switch(op->operands[x]->type) {
+				case type_register:
+					op->operands[x]->components = 1;
+					break;
+				case type_predicate:
+					op->operands[x]->components = 1;
+					break;
+				case type_special_reg:
+					op->operands[x]->components = 1;
+					break;
+				case type_mem:
+					op->operands[x]->components = 2;
+					break;
+				case type_const_mem:
+					op->operands[x]->components = 6;
+					break;
+				case type_sb:
+					op->operands[x]->components = 1;
+					break;
+				case type_hex:
+					op->operands[x]->components = 1;
+					break;
+				case type_bit_list:
+					op->operands[x]->components = 1;
+					break;
+				case type_texture_operand:
+					op->operands[x]->components = 1;
+					break;
+				case type_channel:
+					op->operands[x]->components = 1;
+					break;
+				default:
+					break;
+			}
+			
+			op->operands[x]->properties = (operand_prop) 0;
+			for(int y = 0; y < 64; y++) {
+				op->operands[x]->possibleStart1[y] = true;
+				op->operands[x]->maxBits1[y] = 64 - y;
+				op->operands[x]->possibleStart2[y] = true;
+				op->operands[x]->maxBits2[y] = 64 - y;
+				op->operands[x]->possibleStart3[y] = true;
+				op->operands[x]->maxBits3[y] = 64 - y;
+			}
+			
+			int propid = 1;
+			int propcounter = 0;
+			while(propid < 16) {
+				if(propid == prop_minus && hasMod(inst, "PO")) {
+					cerr << "FATAL ERROR py~1180.\n";
+					cerr << "\tCan't handle this PO modifier, due to its strange interaction with unary functions.\n";
+				}
+				if(inst->operands[x]->properties & propid) {
+					op->operands[x]->properties = op->operands[x]->properties | (operand_prop) propid;
+					for(int y = 0; y < 64; y++) {
+						op->operands[x]->propMatters[propcounter][y] = true;
+						op->operands[x]->propVals[propcounter][y] = hex[y];
+					}
+				} else {
+					for(int y = 0; y < 64; y++) {
+						op->operands[x]->propMatters[propcounter][y] = true;
+						op->operands[x]->propVals[propcounter][y] = !hex[y];
+					}
+				}
+				
+				propid *= 2;
+				propcounter++;
+			}
+			
+			node * iter = inst->operands[x]->mods;
+			while(iter) {
+				char * modstr = (char*) iter->value;
+				operationMod * mod = addMod(op->operands[x], modstr, hex);
+				for(int y = 0; y < 64; y++) {
+					mod->matters[y] = true;
+					mod->vals[y] = hex[y];
+					mod->antivals[y] = !hex[y];
+				}
+				iter = iter->next;
+			}
+		}
+		
+		addFirst(&operations[inst->op], op);
+	}
+	
+	op->confirmedGuard = op->confirmedGuard || inst->guard;
+	//ARTIFACT: added this block to solve a reviewer's compiler setting guard bits on CAL instructions:
+	if(guardLoc >= 0 && !op->confirmedGuard && !op->binidmatters[guardLoc]) {
+		if(hex[guardLoc] && hex[guardLoc + 1] && hex[guardLoc + 2] && !hex[guardLoc + 3]) {
+			op->confirmedGuard = true;
+			for(int x = 0; x < op->numOperands && op->confirmedGuard; x++) {
+				if(op->operands[x]->components > 0) {
+					for(int y = 0; y < 64 && op->confirmedGuard; y++) {
+						if(op->operands[x]->possibleStart1[y] && y < guardLoc + 3) {
+							if(y + op->operands[x]->maxBits1[y] > guardLoc) {
+								op->confirmedGuard = false;
+							}
+						}
+					}
+				}
+				
+				if(op->operands[x]->components > 1) {
+					for(int y = 0; y < 64 && op->confirmedGuard; y++) {
+						if(op->operands[x]->possibleStart2[y] && y < guardLoc + 3) {
+							if(y + op->operands[x]->maxBits2[y] > guardLoc) {
+								op->confirmedGuard = false;
+							}
+						}
+					}
+				}
+				
+				if(op->operands[x]->components > 1) {
+					for(int y = 0; y < 64 && op->confirmedGuard; y++) {
+						if(op->operands[x]->possibleStart3[y] && y < guardLoc + 3) {
+							if(y + op->operands[x]->maxBits3[y] > guardLoc) {
+								op->confirmedGuard = false;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	for(int x = 0; x < 64; x++) {
+		if(op->binid[x] != hex[x]) {
+			op->binidmatters[x] = false;
+		}
+		
+	}
+	
+	bool seen[NUM_MOD_TYPES];
+	for(int x = 0; x < NUM_MOD_TYPES; x++) {
+		seen[x] = false;
+	}
+	
+	iter = inst->mods;
+	while(iter) {
+		char * modstr = (char*) iter->value;
+		operationMod * mod = hasMod(op, modstr, seen[getModType(modstr)]);
+		if(!mod) {
+			mod = addMod(op, modstr, seen[getModType(modstr)], hex);
+			for(int y = 0; y < 64; y++) {
+				mod->matters[y] = true;
+				mod->vals[y] = hex[y];
+				mod->antivals[y] = !hex[y];
+			}
+			if(mod->type == MOD_FLAG && !newOperation) {
+				mod->seenAntiVal = true;
+				for(int y = 0; y < 64; y++) {
+					if(mod->antivals[y] && !op->binid[y]) {
+						mod->matters[y] = false;
+						mod->antivals[y] = false;
+					}
+				}
+			}
+		} else {
+			for(int y = 0; y < 64; y++) {
+				if(mod->vals[y] != hex[y]) {
+					mod->matters[y] = false;
+				}
+			}
+		}
+		if(mod->type > 0) {
+			seen[mod->type] = true;
+		}
+		iter = iter->next;
+	}
+	iter = op->mods;
+	while(iter) {
+		operationMod * mod = (operationMod *) iter->value;
+		if(!hasMod(inst, mod->token)) {
+			if(mod->type == MOD_FLAG) {
+				mod->seenAntiVal = true;
+				for(int y = 0; y < 64; y++) {
+					if(mod->vals[y] == hex[y]) {
+						mod->matters[y] = false;
+						mod->antivals[y] = false;
+					}
+				}
+			}
+		}
+		iter = iter->next;
+	}
+	
+	for(int x = 0; x < op->numOperands; x++) {
+		if(inst->operands[x]->reg >= 0) {
+			op->operands[x]->components = op->operands[x]->components | 1;
+		}
+		op->operands[x]->decimal = op->operands[x]->decimal || inst->operands[x]->decimal;
+		if(!inst->operands[x]->bad) {
+			int info1, info2, info3;
+			int possibleCount1 = 0;
+			int possibleCount2 = 0;
+			int possibleCount3 = 0;
+			for(int y = 0; y < 64; y++) {
+				if(op->operands[x]->components & 1) {
+					if(op->operands[x]->possibleStart1[y]) {
+						int temp = getMaxOperandBits(hex, y, inst, x, 1, info1);
+						if(temp < op->operands[x]->maxBits1[y]) {
+							op->operands[x]->maxBits1[y] = temp;
+						}
+						if(!op->operands[x]->maxBits1[y]) {
+							op->operands[x]->possibleStart1[y] = false;
+						} else {
+							possibleCount1++;
+						}
+					}
+				}
+				if(op->operands[x]->components & 2) {
+					if(op->operands[x]->possibleStart2[y]) {
+						int temp = getMaxOperandBits(hex, y, inst, x, 2, info2);
+						if(temp < op->operands[x]->maxBits2[y]) {
+							op->operands[x]->maxBits2[y] = temp;
+						}
+						if(!op->operands[x]->maxBits2[y]) {
+							op->operands[x]->possibleStart2[y] = false;
+						} else {
+							possibleCount2++;
+						}
+					}
+				}
+				if(op->operands[x]->components & 4) {
+					if(op->operands[x]->possibleStart3[y]) {
+						int temp = getMaxOperandBits(hex, y, inst, x, 3, info3);
+						if(temp < op->operands[x]->maxBits3[y]) {
+							op->operands[x]->maxBits3[y] = temp;
+						}
+						if(!op->operands[x]->maxBits3[y]) {
+							op->operands[x]->possibleStart3[y] = false;
+						} else {
+							possibleCount3++;
+						}
+					}
+				}
+			}
+			
+			if(possibleCount1 == 1) {
+				if(op->operands[x]->type == type_hex) {
+					if(info1 == 2) {
+						op->operands[x]->relative = true;
+					} else if(info1 == 4) {
+						if(inst->operands[x]->properties & prop_minus) {
+							if(!op->operands[x]->addlNegative) {
+								op->operands[x]->incNegative = true;
+							}
+						} else {
+							op->operands[x]->addlNegative = true;
+							op->operands[x]->incNegative = false;
+						}
+					} else if((info1 & 4) && (op->operands[x]->properties & prop_minus)) {
+						op->operands[x]->incNegative = true;
+					}
+				}
+			}
+			/*
+			TODO: why did this cause crashes for instructions that used negative addresses???
+			else if(!possibleCount1 && op->operands[x]->type == type_hex) {
+				cerr << "ERROR: No hex location found.\n";
+				cerr << "Binary: ";
+				for(int bit = 0; bit < 64; bit++) {
+					cerr << hex[bit];
+				}
+				cerr << "\n";
+				cerr << "Hex: " << inst->operands[x]->val1;
+				cerr << "\n";
+				fprintfInstruction(cerr, inst);
+				cerr << "\n";
+			}
+			*/
+			
+			
+			if(possibleCount3 == 1) {
+				if(op->operands[x]->type == type_const_mem) {
+					if(info3 == 2) {
+						op->operands[x]->shiftComp3 = true;
+					}
+				}
+			}
+			
+			int propid = 1;
+			int propcounter = 0;
+			while(propid < 16) {
+				if(propid == prop_minus && hasMod(inst, "PO")) {
+					propid *= 2;
+					propcounter++;
+					continue;
+				}
+				if(inst->operands[x]->properties & propid) {
+					for(int y = 0; y < 64; y++) {
+						if(op->operands[x]->propVals[propcounter][y] != hex[y]) {
+							op->operands[x]->propMatters[propcounter][y] = false;
+						}
+					}
+					op->operands[x]->properties = op->operands[x]->properties | (operand_prop) propid;
+				} else {
+					for(int y = 0; y < 64; y++) {
+						if(op->operands[x]->propVals[propcounter][y] == hex[y]) {
+							op->operands[x]->propMatters[propcounter][y] = false;
+						}
+					}
+				}
+			
+				propid *= 2;
+				propcounter++;
+			}
+		}
+		
+		node * iter = inst->operands[x]->mods;
+		while(iter) {
+			char * modstr = (char*) iter->value;
+			operationMod * mod = hasMod(op->operands[x], modstr);
+			if(!mod) {
+				mod = addMod(op->operands[x], modstr, hex);
+				for(int y = 0; y < 64; y++) {
+					mod->matters[y] = true;
+					mod->vals[y] = hex[y];
+					mod->antivals[y] = !hex[y];
+				}
+			} else {
+				for(int y = 0; y < 64; y++) {
+					if(mod->vals[y] != hex[y]) {
+						mod->matters[y] = false;
+					}
+				}
+			}
+			iter = iter->next;
+		}
+		iter = op->operands[x]->mods;
+		while(iter) {
+			operationMod * mod = (operationMod *) iter->value;
+			if(!hasMod(inst->operands[x], mod->token)) {
+				if(mod->type == MOD_FLAG) {
+					mod->seenAntiVal = true;
+					for(int y = 0; y < 64; y++) {
+						if(mod->vals[y] == hex[y]) {
+							mod->matters[y] = false;
+						}
+					}
+				}
+			}
+			iter = iter->next;
+		}
+	}
+	
+	for(int x = 1; x < NUM_MOD_TYPES; x++) {
+		if(!seen[x]) {
+			for(int y = 0; y < 64; y++) {
+				if(op->noModBits[x][y] != hex[y]) {
+					op->noModBits[x][y] = false;
+				}
+			}
+		}
+	}
+}
+
+/**
+ * Parses persistent data (the operation list) from stdin.
+ * Stops parsing when it sees -1.
+ */
+void inputData() {
+	//Get old data from stdin
+	int counter = 0;
+	int num;
+	operations[counter] = 0;
+	cin >> num;
+	if(num >= 0) {
+		_arch = num;
+		if(_arch >= 35) {
+			maxregval = 255;
+			maxregbits = 8;
+		}
+		cin >> num;
+	}
+	
+	while(num >= 0) {
+		for(int subop = 0; subop < num; subop++) {
+			operation * op = (operation*) malloc(sizeof(operation));
+			for(int x = 0; x < 8; x++) {
+				op->operands[x] = 0;
+			}
+			op->mods = 0;
+			
+			cin >> op->op;
+			cin >> op->confirmedGuard;
+			for(int x = 0; x < 64; x++) {
+				cin >> op->binidmatters[x];
+				cin >> op->binid[x];
+			}
+			
+			int numMods;
+			cin >> numMods;
+			for(int y = 0; y < numMods; y++) {
+				string modstr;
+				cin >> modstr;
+				int count;
+				cin >> count;
+				operationMod * mod = addMod(op, modstr.c_str(), count, 0);
+				cin >> mod->seenAntiVal;
+				for(int y = 0; y < 64; y++) {
+					cin >> mod->matters[y];
+					cin >> mod->vals[y];
+					cin >> mod->antivals[y];
+				}
+			}
+			
+			cin >> op->numOperands;
+			for(int x = 0; x < op->numOperands; x++) {
+				op->operands[x] = (operationOperand*) malloc(sizeof(operationOperand));
+				cin >> op->operands[x]->decimal;
+				cin >> op->operands[x]->relative;
+				cin >> op->operands[x]->incNegative;
+				cin >> op->operands[x]->addlNegative;
+				cin >> op->operands[x]->shiftComp3;
+				int type;
+				cin >> type;
+				op->operands[x]->type = static_cast<token_type>(type);
+				op->operands[x]->mods = 0;
+				cin >> op->operands[x]->components;
+				int props;
+				cin >> props;
+				op->operands[x]->properties = (operand_prop) props;
+				for(int y = 0; y < 64; y++) {
+					cin >> op->operands[x]->possibleStart1[y];
+					cin >> op->operands[x]->maxBits1[y];
+					cin >> op->operands[x]->possibleStart2[y];
+					cin >> op->operands[x]->maxBits2[y];
+					cin >> op->operands[x]->possibleStart3[y];
+					cin >> op->operands[x]->maxBits3[y];
+				}
+				
+				for(int y = 0; y < 4; y++) {
+					for(int z = 0; z < 64; z++) {
+						cin >> op->operands[x]->propMatters[y][z];
+						cin >> op->operands[x]->propVals[y][z];
+					}
+				}
+				
+				int numMods;
+				cin >> numMods;
+				for(int y = 0; y < numMods; y++) {
+					string modstr;
+					cin >> modstr;
+					operationMod * mod = addMod(op->operands[x], modstr.c_str(), 0);
+					cin >> mod->seenAntiVal;
+					for(int z = 0; z < 64; z++) {
+						cin >> mod->matters[z];
+						cin >> mod->vals[z];
+						cin >> mod->antivals[z];
+					}
+				}
+				
+				for(int modType = 1; modType < NUM_MOD_TYPES; modType++) {
+					for(int bit = 0; bit < 64; bit++) {
+						cin >> op->noModBits[modType][bit];
+					}
+				}
+			}
+			addLast(&operations[counter], op);
+		}
+		
+		num = 0;
+		cin >> num;
+		counter++;
+	}
+}
+
+/**
+ * Writes persistent data (the operation list) to stdout.
+ */
+void outputData() {
+	//Output new data to stdout
+	cout << _arch << "\n";
+	int counter = 0;
+	while(opcodes[counter]) {
+		int num = listSize(operations[counter]);
+		cout << num << "\n";
+		node * iter = operations[counter];
+		while(iter) {
+			operation * op = (operation*) iter->value;
+			
+			cout << op->op << "\n";
+			cout << op->confirmedGuard << "\n";
+			for(int x = 0; x < 64; x++) {
+				cout << op->binidmatters[x] << "\n";
+				cout << op->binid[x] << "\n";
+			}
+			
+			int numMods = listSize(op->mods);
+			cout << numMods << "\n";
+			node * mods = op->mods;
+			while(mods) {
+				operationMod * mod = (operationMod*) mods->value;
+				cout << mod->token << "\n";
+				cout << mod->count << "\n";
+				cout << mod->seenAntiVal << "\n";
+				for(int y = 0; y < 64; y++) {
+					cout << mod->matters[y] << "\n";
+					cout << mod->vals[y] << "\n";
+					cout << mod->antivals[y] << "\n";
+				}
+				mods = mods->next;
+			}
+		
+			cout << op->numOperands << "\n";
+			for(int x = 0; x < op->numOperands; x++) {
+				cout << op->operands[x]->decimal << "\n";
+				cout << op->operands[x]->relative << "\n";
+				cout << op->operands[x]->incNegative << "\n";
+				cout << op->operands[x]->addlNegative << "\n";
+				cout << op->operands[x]->shiftComp3 << "\n";
+				cout << op->operands[x]->type << "\n";
+				cout << op->operands[x]->components << "\n";
+				cout << (int)op->operands[x]->properties << "\n";
+				for(int y = 0; y < 64; y++) {
+					cout << op->operands[x]->possibleStart1[y] << "\n";
+					cout << op->operands[x]->maxBits1[y] << "\n";
+					cout << op->operands[x]->possibleStart2[y] << "\n";
+					cout << op->operands[x]->maxBits2[y] << "\n";
+					cout << op->operands[x]->possibleStart3[y] << "\n";
+					cout << op->operands[x]->maxBits3[y] << "\n";
+				}
+				
+				for(int y = 0; y < 4; y++) {
+					for(int z = 0; z < 64; z++) {
+						cout << op->operands[x]->propMatters[y][z] << "\n";
+						cout << op->operands[x]->propVals[y][z] << "\n";
+					}
+				}
+				
+				int numMods = listSize(op->operands[x]->mods);
+				cout << numMods << "\n";
+				node * mods = op->operands[x]->mods;
+				while(mods) {
+					operationMod * mod = (operationMod*) mods->value;
+					cout << mod->token << "\n";
+					cout << mod->seenAntiVal << "\n";
+					for(int z = 0; z < 64; z++) {
+						cout << mod->matters[z] << "\n";
+						cout << mod->vals[z] << "\n";
+						cout << mod->antivals[z] << "\n";
+					}
+					mods = mods->next;
+				}
+				
+				for(int modType = 1; modType < NUM_MOD_TYPES; modType++) {
+					for(int bit = 0; bit < 64; bit++) {
+						cout << op->noModBits[modType][bit] << "\n";
+					}
+				}
+			}
+			iter = iter->next;
+		}
+		
+		counter++;
+	}
+	cout << "-1\n";
+}
+
+/**
+ * For instructions with same opcode, compares modifiers and operands to try to learn more.
+ */
+void crossReferenceOps() {
+	node * ops;
+	for(int opid = 0; opcodes[opid]; opid++) {
+		//Cross reference comfirmedGuard flag:
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			node * ops2 = ops->next;
+			while(ops2) {
+				operation * op2 = (operation*) ops2->value;
+				op->confirmedGuard = op2->confirmedGuard = (op->confirmedGuard || op2->confirmedGuard);
+				
+				ops2 = ops2->next;
+			}
+			ops = ops->next;
+		}
+		
+		//Remove operand bits from opcodes
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			for(int randID = 0; randID < op->numOperands; randID++) {
+				operationOperand * rand = op->operands[randID];
+				if(rand->components & 1) {
+					for(int bit = 0; bit < 64; bit++) {
+						if(rand->possibleStart1[bit]) {
+							for(int bit2 = bit; bit2 < bit + rand->maxBits1[bit]; bit2++) {
+								op->binidmatters[bit2] = false;
+							}
+						}
+					}
+				}
+				if(rand->components & 2) {
+					for(int bit = 0; bit < 64; bit++) {
+						if(rand->possibleStart2[bit]) {
+							for(int bit2 = bit; bit2 < bit + rand->maxBits2[bit]; bit2++) {
+								op->binidmatters[bit2] = false;
+							}
+						}
+					}
+				}
+				if(rand->components & 4) {
+					for(int bit = 0; bit < 64; bit++) {
+						if(rand->possibleStart3[bit]) {
+							for(int bit2 = bit; bit2 < bit + rand->maxBits3[bit]; bit2++) {
+								op->binidmatters[bit2] = false;
+							}
+						}
+					}
+				}
+			}
+			ops = ops->next;
+		}
+		
+		//Remove opcode bits, operand bits, etc from mods
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			node * mods = op->mods;
+			while(mods) {
+				operationMod * mod = (operationMod*) mods->value;
+				//Architecture-specific, manual optimizations:
+				if((_arch > 30 && _arch < 50)) {
+					if(!strcmp(mod->token, "S")) {
+						for(int bit = 0; bit < 64; bit++) {
+							if(bit != 22) {
+								mod->matters[bit] = false;
+							}
+						}
+					}
+				}				
+				
+				for(int bit = 0; bit < 64; bit++) {
+					mod->matters[bit] = mod->matters[bit] && !op->binidmatters[bit];
+				}
+				
+				for(int randID = 0; randID < op->numOperands; randID++) {
+					operationOperand * rand = op->operands[randID];
+					if(rand->components & 1) {
+						for(int bit = 0; bit < 64; bit++) {
+							if(rand->possibleStart1[bit]) {
+								for(int bit2 = bit; bit2 < bit + rand->maxBits1[bit]; bit2++) {
+									mod->matters[bit2] = false;
+								}
+							}
+						}
+					}
+					if(rand->components & 2) {
+						for(int bit = 0; bit < 64; bit++) {
+							if(rand->possibleStart2[bit]) {
+								for(int bit2 = bit; bit2 < bit + rand->maxBits2[bit]; bit2++) {
+									mod->matters[bit2] = false;
+								}
+							}
+						}
+					}
+					if(rand->components & 4) {
+						for(int bit = 0; bit < 64; bit++) {
+							if(rand->possibleStart3[bit]) {
+								for(int bit2 = bit; bit2 < bit + rand->maxBits3[bit]; bit2++) {
+									mod->matters[bit2] = false;
+								}
+							}
+						}
+					}
+				}
+				
+				mods = mods->next;
+			}
+			ops = ops->next;
+		}
+		
+		/*Compare non-flag mods of same type to determine which bits matter
+		for(int x = 1; x < NUM_MOD_TYPES; x++) {
+			for(int y = 0; y < 4; y++) {
+				ops = operations[opid];
+				while(ops) {
+					operation * op = (operation*) ops->value;
+					bool cumulative[64] = {false};
+					node * mods = op->mods;
+					while(mods) {
+						operationMod * mod = (operationMod*) mods->value;
+						if(mod->type == x && mod->count == y) {
+							for(int bit = 0; bit < 64; bit++) {
+								cumulative[bit] = cumulative[bit] || !mod->matters[bit];
+							}
+						}
+						mods = mods->next;
+					}
+					mods = op->mods;
+					while(mods) {
+						operationMod * mod = (operationMod*) mods->value;
+						if(mod->type == x && mod->count == y) {
+							for(int bit = 0; bit < 64; bit++) {
+								mod->matters[bit] = mod->matters[bit] && !cumulative[bit];
+							}
+						}
+						mods = mods->next;
+					}
+					ops = ops->next;
+				}
+			}
+		}//*/
+		
+		//Remove operand bits from operand properties' bits:
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			for(int randID2 = 0; randID2 < op->numOperands; randID2++) {
+				operationOperand * rand2 = op->operands[randID2];
+				for(int randID = 0; randID < op->numOperands; randID++) {
+					operationOperand * rand = op->operands[randID];
+					for(int y = 0; y < 4; y++) {
+						if(rand->components & 1) {
+							for(int bit = 0; bit < 64; bit++) {
+								if(rand->possibleStart1[bit]) {
+									for(int bit2 = bit; bit2 < bit + rand->maxBits1[bit]; bit2++) {
+										rand2->propMatters[y][bit2] = false;
+									}
+								}
+							}
+						}
+						if(rand->components & 2) {
+							for(int bit = 0; bit < 64; bit++) {
+								if(rand->possibleStart2[bit]) {
+									for(int bit2 = bit; bit2 < bit + rand->maxBits2[bit]; bit2++) {
+										rand2->propMatters[y][bit2] = false;
+									}
+								}
+							}
+						}
+						if(rand->components & 4) {
+							for(int bit = 0; bit < 64; bit++) {
+								if(rand->possibleStart3[bit]) {
+									for(int bit2 = bit; bit2 < bit + rand->maxBits3[bit]; bit2++) {
+										rand2->propMatters[y][bit2] = false;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			ops = ops->next;
+		}
+		
+		//Determine which mods may be unsafe to combine:
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			node * ops2 = ops;
+			while(ops2) {
+				operation * op2 = (operation*) ops2->value;
+				
+				node * mods = op->mods;
+				while(mods) {
+					operationMod * mod = (operationMod*) mods->value;
+					operationMod * mod2 = hasMod(op2, mod->token, mod->count);
+					
+					int numMatchingBits = 0;
+					
+					if(mod2) {
+						for(int bit = 0; bit < 64; bit++) {
+							if(mod->matters[bit] || mod2->matters[bit]) {
+								if(op->binidmatters[bit] != op2->binidmatters[bit] && op->binid[bit] != op2->binid[bit]) { 
+									mod->combine = mod2->combine = false;
+								} else if(mod->matters[bit] == mod2->matters[bit] && mod->vals[bit] != mod2->vals[bit]) {
+									//This doesn't seem necessary so far, so I'm commenting it out for now:
+									//mod->combine = mod2->combine = false;
+								}
+							}
+							if(mod->matters[bit] && mod2->matters[bit] && mod->vals[bit] == mod2->vals[bit]) {
+								numMatchingBits++;
+							}
+						}
+						
+						if(!numMatchingBits) {
+							mod->combine = mod2->combine = false;
+						}
+					} else {
+						/*//Note: this part caused issues for some reason, so I commented it out:
+						for(int bit = 0; bit < 64; bit++) {
+							if(mod->matters[bit] && !op->binidmatters[bit] && op2->binidmatters[bit]) { 
+								mod->combine = false;
+							}
+						}*/
+					}
+					mods = mods->next;
+				}
+				
+				ops2 = ops2->next;
+			}
+			ops = ops->next;
+		}
+		
+		//TODO: deal with case that ordered mods incorrectly have (only) second's combine false
+		
+		//Match combine field for same mod across different operations of this opcode:
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			node * ops2 = operations[opid];
+			while(ops2) {
+				operation * op2 = (operation*) ops2->value;
+				
+				node * mods = op->mods;
+				while(mods) {
+					operationMod * mod = (operationMod*) mods->value;
+					operationMod * mod2 = hasMod(op2, mod->token, mod->count);
+					if(mod2) {
+						mod->combine = mod->combine && mod2->combine;
+						mod2->combine = mod->combine;
+					}
+										
+					mods = mods->next;
+				}
+				
+				ops2 = ops2->next;
+			}
+			ops = ops->next;
+		}
+		
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			node * ops2 = operations[opid];
+			while(ops2) {
+				operation * op2 = (operation*) ops2->value;
+				
+				node * mods = op->mods;
+				while(mods) {
+					operationMod * mod = (operationMod*) mods->value;
+					if(mod->combine) {
+						operationMod * mod2 = hasMod(op2, mod->token, mod->count);
+						if(mod2) {
+							if(!mod2->combine) {
+								cerr << "SANITY CHECK ERROR py~1839.\n";
+								cerr << "\tThis error message should be unreachable with current logic.\n";
+							}
+							
+							for(int bit = 0; bit < 64; bit++) {
+								if(mod->matters[bit] != mod2->matters[bit] || mod->vals[bit] != mod2->vals[bit]) { 
+									mod->matters[bit] = mod2->matters[bit] = false;
+								}
+							}
+							if(mod->seenAntiVal != mod2->seenAntiVal) {
+								mod->seenAntiVal = mod2->seenAntiVal = true;
+							}
+						} else {
+							operationMod * mod2 = addMod(op2, mod->token, mod->count, 0);
+							mod2->seenAntiVal = mod->seenAntiVal;
+							for(int y = 0; y < 64; y++) {
+								mod2->matters[y] = mod->matters[y];
+								mod2->vals[y] = mod->vals[y];
+								mod2->antivals[y] = mod->antivals[y];
+							}
+						}
+					} else if(op2 == operations[opid]->value && !hasMod(op2, mod->token, mod->count)) {
+						//TODO Change things elsewhere so this is not necessary:
+						operationMod * mod2 = addMod(op2, mod->token, mod->count, 0);
+						mod2->combine = false;
+						mod2->seenAntiVal = mod->seenAntiVal;
+						for(int y = 0; y < 64; y++) {
+							if(mod->type == MOD_FLAG) {
+								if(mod->matters[y] && mod->vals[y] == op2->binid[y]) {
+									mod2->matters[y] = true;
+								} else {
+									mod2->matters[y] = false;
+								}
+							} else {
+								mod2->matters[y] = mod->matters[y];
+							}
+							mod2->vals[y] = mod->vals[y];
+							mod2->antivals[y] = mod->antivals[y];
+						}
+					}
+					mods = mods->next;
+				}
+				
+				ops2 = ops2->next;
+			}
+			ops = ops->next;
+		}
+	}
+}
+
+/**
+ * Prevents the assembler generator from using crossReferenceOps to compare modifiers.
+ * I must have used this for debugging at some point.
+ */
+void dontCombineMods() {
+	node * ops;
+	for(int opid = 0; opcodes[opid]; opid++) {
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			node * mods = op->mods;
+			while(mods) {
+				operationMod * mod = (operationMod*) mods->value;
+				mod->combine = false;
+				mods = mods->next;
+			}
+			ops = ops->next;
+		}
+	}
+}
+
+/**
+ * Outputs assembler generator to stdout, as C++ code.
+ * Note that this doesn't produce a complete cpp file;
+ * it should be copied and pasted inside an assembler function.
+ */
+void outputTranslations() {
+	crossReferenceOps();
+	//dontCombineMods();
+	
+	int guardLoc;
+	cout << "\tint checkrandmods = 0;\n";
+	if(_arch <= 30) {
+		cerr << "FATAL ERROR: unsupported architecture; need to add predicate guard location, handling of (lack of) scheduling info.\n";
+		exit(0);
+	} else if((_arch > 30 && _arch < 50)) {
+		guardLoc = 18;
+	} else if((_arch >= 50 && _arch < 70)) {
+		guardLoc = 16;
+	} else {
+		cerr << "FATAL ERROR: unsupported architecture. Need to add guard location, handle scheduling bits, and fix my datatypes to support 16-byte instructions.\n";
+		exit(0);
+	}
+	cout << "\tint guardLoc = " << guardLoc << ";\n";
+	cout << "\tbool binary[64];\n";
+	cout << "\tfor(int x = 0; x < 64; x++) {\n";
+	cout << "\t\tbinary[x] = 0;\n";
+	cout << "\t}\n";
+	cout << "\tbool canGuard = true;\n";
+	cout << "\tbool seenModType[" << NUM_MOD_TYPES << "];\n";
+	cout << "\tfor(int x = 0; x < " << NUM_MOD_TYPES << "; x++) {\n";
+	cout << "\t\tseenModType[x] = false;\n";
+	cout << "\t}\n";
+	cout << "\n";
+	
+	for(int opid = 0; ; opid++) {
+		if(!opcodes[opid]) {
+			break;
+		}
+		
+		bool seenModType[NUM_MOD_TYPES] = {false};
+		bool modOrderMatters[NUM_MOD_TYPES] = {false};
+		
+		if(opid) {
+			cout << " else ";
+		} else {
+			cout << "\t";
+		}
+		cout << "if(opcode_" << opcodes[opid] << " == " << "inst->op) {\n";
+		bool sharedOp[64];
+		for(int x = 0; x < 64; x++) {
+			sharedOp[x] = true;
+		}
+		bool unsharedOp[64];
+		for(int x = 0; x < 64; x++) {
+			unsharedOp[x] = false;
+		}
+		
+		node * ops = operations[opid];
+		if(ops) {
+			while(ops) {
+				operation * op = (operation*) ops->value;
+				
+				node * mods = op->mods;
+				while(mods) {
+					operationMod * mod = (operationMod*) mods->value;
+					if(mod->count) {
+						modOrderMatters[mod->type] = true;
+					}
+					mods = mods->next;
+				}
+				
+				for(int x = 0; x < 64; x++) {
+					if(!op->binidmatters[x] || !op->binid[x]) {
+						sharedOp[x] = false;
+					}
+					if(op->binidmatters[x] && op->binid[x]) {
+						unsharedOp[x] = true;
+					}
+				}
+				ops = ops->next;
+			}
+			
+			ops = operations[opid];
+			while(ops) {
+				operation * op = (operation*) ops->value;
+				for(int type = 1; type < NUM_MOD_TYPES; type++) {
+					int bitSum = 0;
+					for(int x = 0; x < 64; x++) {
+						if(!sharedOp[x] && op->noModBits[type][x]) {//TODO sharedRands
+							bitSum++;
+						}
+					}
+					if(bitSum != 64 && bitSum != 0) {
+						modOrderMatters[type] = true;
+					}
+				}
+				ops = ops->next;
+			}
+		} else {
+			cout << "\t\tcerr << \"ERROR: unimplemented operation " << opcodes[opid] << ".\\n\";\n";
+			//cout << "\t\texit(0);\n";
+			cout << "\t}";
+			
+			if(!opcodes[opid+1]) {
+				cout << " else if(opcode_BINCODE != inst->op) {\n";
+				cout << "\t\tcerr << \"ERROR: Unimplemented instruction: \" << opcodes[inst->op] << \".\\n\";\n";
+				cout << "\t}\n";
+				cout << "\n";
+			}
+			
+			continue;
+		}
+		
+		if(!((operation*)operations[opid]->value)->confirmedGuard) {
+			cout << "\t\tcanGuard = false;\n";
+		}
+		
+		for(int x = 0; x < 64; x++) {
+			if(sharedOp[x]) {
+				unsharedOp[x] = false;
+				cout << "\t\tbinary[" << x << "] = true;\n";
+			}
+		}
+		
+		bool operandBits[64];
+		bool alwaysOperandBits[64];
+		for(int x = 0; x < 64; x++) {
+			operandBits[x] = false;
+			alwaysOperandBits[x] = true;
+		}
+		
+		//Figure out which bits are always used for operands:
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation *) ops->value;
+			for(int randID = 0; randID < op->numOperands; randID++) {
+				operationOperand * rand = op->operands[randID];
+				for(int bit = 0; bit < 64; bit++) {
+					if(rand->components & 0x1) {
+						if(rand->possibleStart1[bit]) {
+							for(int b = bit; b < rand->maxBits1[bit]; b++) {
+								operandBits[b] = true;
+							}
+						}
+					}
+					if(rand->components & 0x2) {
+						if(rand->possibleStart2[bit]) {
+							for(int b = bit; b < rand->maxBits2[bit]; b++) {
+								operandBits[b] = true;
+							}
+						}
+					}
+					if(rand->components & 0x4) {
+						if(rand->possibleStart3[bit]) {
+							for(int b = bit; b < rand->maxBits3[bit]; b++) {
+								operandBits[b] = true;
+							}
+						}
+					}
+				}
+			}
+			for(int x = 0; x < 64; x++) {
+				if(!operandBits[x]) {
+					alwaysOperandBits[x] = false;
+				} else {
+					operandBits[x] = false;
+				}
+			}
+			ops = ops->next;
+		}
+		
+		//Determine which operands can be shared between all operations on this opcode:
+		bool canShareRand[8] = {true, true, true, true, true, true, true, true};
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation *) ops->value;
+			
+			for(int x = op->numOperands; x < 8; x++) {
+				canShareRand[x] = false;
+			}
+			
+			node * ops2 = ops->next;
+			while(ops2) {
+				operation * op2 = (operation *) ops2->value;
+				for(int randID = 0; randID < op->numOperands && randID < op2->numOperands; randID++) {
+					operationOperand * rand = op->operands[randID];
+					operationOperand * rand2 = op2->operands[randID];
+					if(rand->type != rand2->type) {
+						canShareRand[randID] = false;
+					} else {
+						if(rand->components != rand2->components) {
+							canShareRand[randID] = false;
+						} else {
+							for(int bit = 0; bit < 64; bit++) {
+								if(rand->components & 0x1) {
+									if(rand->possibleStart1[bit] != rand2->possibleStart1[bit]) {
+										canShareRand[randID] = false;
+									}
+								}
+								if(rand->components & 0x2) {
+									if(rand->possibleStart2[bit] != rand2->possibleStart2[bit]) {
+										canShareRand[randID] = false;
+									}
+								}
+								if(rand->components & 0x4) {
+									if(rand->possibleStart3[bit] != rand2->possibleStart3[bit]) {
+										canShareRand[randID] = false;
+									}
+								}
+							}
+						}
+					}
+				}
+				ops2 = ops2->next;
+			}
+			ops = ops->next;
+		}
+		//TODO crossreference shared rands to ensure completeness
+		
+		//Deal with shared operands:
+		for(int rid = 0; operations[opid] && rid < 8; rid++) {
+			if(canShareRand[rid]) {
+				operation * op = (operation *) operations[opid]->value;
+				operationOperand * rand = op->operands[rid];
+								
+				int start1 = -1;
+				int start2 = -1;
+				int start3 = -1;
+				
+				for(int x = 0; x < 64; x++) {
+					if(rand->components & 1) {
+						string postPend = "";
+						if(rand->possibleStart1[x]) {
+							if(start1 >= 0) {
+								// cerr << "WARNING: operand[" << rid << "]->val1 with multiple starts in " << opcodes[opid] << " (" << start1 << " vs " << x << ").\n";
+							}
+							start1 = x;
+							if(rand->relative) {
+								postPend = " - (inst->size + inst->address)";
+							} else if(rand->addlNegative) {
+								if(rand->decimal) {
+									postPend.append(" ^ (0x1 << ");
+									ostringstream temp;
+									temp << (rand->maxBits1[start1]);
+									postPend.append(temp.str());
+									postPend.append(")");
+								} else {
+									postPend = " * -1";
+								}
+							}
+							
+							cout << "\t\tfor(int randsize = 0; randsize < " << rand->maxBits1[start1] << "; randsize++) {\n";
+							if(rand->incNegative && !rand->relative) {
+								if(rand->decimal) {
+									cout << "\t\t\tbinary[randsize + " << start1 << "] = ((inst->operands[" << rid << "]->val1 ^ (";
+									cout << "(inst->operands[" << rid << "]->properties & prop_minus ? 1 : 0)";
+									cout << " << " << rand->maxBits1[start1] << ")) & (0x1 << randsize));\n";
+								} else {
+									cout << "\t\t\tbinary[randsize + " << start1 << "] = ((inst->operands[" << rid << "]->val1 * ";
+									cout << "(inst->operands[" << rid << "]->properties & prop_minus ? -1 : 1)";
+									cout << ") & (0x1 << randsize));\n";
+								}
+							} else {
+								cout << "\t\t\tbinary[randsize + " << start1 << "] = ((inst->operands[" << rid << "]->val1" << postPend << ") & (0x1 << randsize));\n";
+							}
+							cout << "\t\t}\n";
+					
+							for(int x = start1; x < start1 + rand->maxBits1[start1]; x++) {
+								operandBits[x] = true;
+							}
+						}
+					}
+					if(rand->components & 2) {
+						if(rand->possibleStart2[x]) {
+							if(start2 >= 0) {
+								// cerr << "WARNING: operand[" << rid << "]->val2 with multiple starts in " << opcodes[opid] << " (" << start2 << " vs " << x << ").\n";
+							}
+							start2 = x;
+							cout << "\t\tfor(int randsize = 0; randsize < " << rand->maxBits2[start2] << "; randsize++) {\n";
+							cout << "\t\t\tbinary[randsize + " << start2 << "] = (inst->operands[" << rid << "]->val2 & (0x1 << randsize));\n";
+							cout << "\t\t}\n";
+							
+							for(int x = start2; x < start2 + rand->maxBits2[start2]; x++) {
+								operandBits[x] = true;
+							}
+						}
+					}
+					if(rand->components & 4) {
+						if(rand->possibleStart3[x]) {
+							if(start3 >= 0) {
+								// cerr << "WARNING: operand[" << rid << "]->val3 with multiple starts in " << opcodes[opid] << " (" << start3 << " vs " << x << ").\n";
+							}
+							start3 = x;
+							if(rand->shiftComp3) {
+								cout << "\t\tfor(int randsize = 0; randsize < " << rand->maxBits3[start3] << "; randsize++) {\n";
+								cout << "\t\t\tbinary[randsize + " << start3 << "] = (inst->operands[" << rid << "]->val3 & (0x1 << (randsize + 2)));\n";
+								cout << "\t\t}\n";
+							} else {
+								cout << "\t\tfor(int randsize = 0; randsize < " << rand->maxBits3[start3] << "; randsize++) {\n";
+								cout << "\t\t\tbinary[randsize + " << start3 << "] = (inst->operands[" << rid << "]->val3 & (0x1 << randsize));\n";
+								cout << "\t\t}\n";
+							}
+							
+							for(int x = start3; x < start3 + rand->maxBits3[start3]; x++) {
+								operandBits[x] = true;
+							}
+						}
+					}
+				}
+				
+				if(rand->components & 1) {
+					if(start1 < 0) {
+						cout << "\t\t//TODO: add manual code for " << opcodes[opid] << "[" << rid << "]\n";
+						// cerr << "WARNING: operand[" << rid << "]->val1 without possible start in " << opcodes[opid] << ".\n";
+						// cerr << "WARNING: clarification; operands are ";
+						// for(int ops2 = 0; ops2 < op->numOperands; ops2++) {
+							// if(op->operands[ops2]->type == type_sb) {
+								// cerr << "sb, ";
+							// } else if(op->operands[ops2]->type == type_hex) {
+								// cerr << "hex, ";
+							// } else if(op->operands[ops2]->type == type_bit_list) {
+								// cerr << "bit_list, ";
+							// } else if(op->operands[ops2]->type == type_register) {
+								// cerr << "register, ";
+							// } else if(op->operands[ops2]->type == type_predicate) {
+								// cerr << "predicate, ";
+							// } else if(op->operands[ops2]->type == type_const_mem) {
+								// cerr << "const, ";
+							// } else if(op->operands[ops2]->type == type_mem) {
+								// cerr << "mem, ";
+							// } else if(op->operands[ops2]->type == type_texture_operand) {
+								// cerr << "texture, ";
+							// } else if(op->operands[ops2]->type == type_channel) {
+								// cerr << "channel, ";
+							// } else if(op->operands[ops2]->type == type_special_reg) {
+								// cerr << "special, ";
+							// } else {
+								// cerr << "???, ";
+							// }
+						// }
+						// cerr << "\n";
+						continue;
+					}
+				}
+				if(rand->components & 2) {
+					if(start2 < 0) {
+						cout << "\t\t//TODO: add manual code for " << opcodes[opid] << "[" << rid << "]\n";
+						// cerr << "WARNING: operand[" << rid << "]->val2 without possible start in " << opcodes[opid] << ".\n";
+						// if(rand->type == type_hex) {
+							// cerr << "hex";
+						// } else if(rand->type == type_register) {
+							// cerr << "register";
+						// } else if(rand->type == type_predicate) {
+							// cerr << "predicate";
+						// } else if(rand->type == type_const_mem) {
+							// cerr << "const";
+						// } else if(rand->type == type_mem) {
+							// cerr << "mem";
+						// } else {
+							// cerr << "????";
+						// }
+						// cerr << "\n";
+						continue;
+					}
+				}
+				if(rand->components & 4) {
+					if(start3 < 0) {
+						cout << "\t\t//TODO: add manual code for " << opcodes[opid] << "[" << rid << "]\n";
+						// cerr << "WARNING: operand[" << rid << "]->val3 without possible start in " << opcodes[opid] << ".\n";
+						// if(rand->type == type_hex) {
+							// cerr << "hex";
+						// } else if(rand->type == type_register) {
+							// cerr << "register";
+						// } else if(rand->type == type_predicate) {
+							// cerr << "predicate";
+						// } else if(rand->type == type_const_mem) {
+							// cerr << "const";
+						// } else if(rand->type == type_mem) {
+							// cerr << "mem";
+						// } else {
+							// cerr << "????";
+						// }
+						// cerr << "\n";
+						continue;
+					}
+				}
+			}
+		}
+		
+		ops = operations[opid];
+		while(ops) {
+			operation * op = (operation *) ops->value;
+			
+			//reset operandBits
+			for(int x = 0; x < 64; x++) {
+				operandBits[x] = alwaysOperandBits[x];
+			}
+			
+			if(ops == operations[opid]) {
+				cout << "\t\tif(";
+			} else {
+				cout << " else if(";
+			}
+			
+			//Avoid duplicating guard bits:
+			if(op->confirmedGuard) {
+				for(int x = guardLoc; x < guardLoc + 4; x++) {
+					sharedOp[x] = true;
+				}
+			}
+			
+			cout << "inst->num_operands == " << op->numOperands;
+			for(int x = 0; x < op->numOperands; x++) {
+				cout << " && inst->operands[" << x << "]->type == ";
+				switch(op->operands[x]->type) {
+					case type_register:
+						cout << "type_register";
+						break;
+					case type_predicate:
+						cout << "type_predicate";
+						break;
+					case type_special_reg:
+						cout << "type_special_reg";
+						break;
+					case type_mem:
+						cout << "type_mem";
+						break;
+					case type_const_mem:
+						cout << "type_const_mem";
+						break;
+					case type_sb:
+						cout << "type_sb";
+						break;
+					case type_hex:
+						cout << "type_hex";
+						break;
+					case type_bit_list:
+						cout << "type_bit_list";
+						break;
+					case type_texture_operand:
+						cout << "type_texture_operand";
+						break;
+					case type_channel:
+						cout << "type_channel";
+						break;
+					case type_other_operand:
+						cout << "type_other_operand";
+						break;
+					default:
+						cout << op->operands[x]->type;
+				}
+			}
+			cout <<  ") {\n";
+			
+			int checkMods = 0;
+			for(int x = 0; x < op->numOperands; x++) {
+				if(op->operands[x]->mods) {
+					operationMod * mod = (operationMod *) op->operands[x]->mods->value;
+					if(op->operands[x]->mods->next || strcmp(mod->token, "reuse")) {
+						checkMods = x + 1;
+					}
+				}
+			}
+			if(checkMods) {
+				cout << "\t\t\tcheckrandmods = " << checkMods << ";\n";
+			}
+			
+			for(int bit = 0; bit < 64; bit++) {
+				if(!sharedOp[bit] && op->binidmatters[bit] && op->binid[bit]) {
+					cout << "\t\t\tbinary[" << bit << "] = true;\n";
+				}
+			}
+			
+			for(int rid = 0; rid < op->numOperands; rid++) {
+				operationOperand * rand = op->operands[rid];
+				int propval = 1;
+				for(int y = 0; y < 4; y++) {
+					if(rand->properties & propval) {
+						//Skip negative prop if must be applied directly to hex operand:
+						//if(propval == prop_minus && rand->incNegative) {
+						//	continue;
+						//}
+						
+						bool nonzero = false;
+						for(int z = 0; z < 64; z++) {
+							if(rand->propMatters[y][z] && rand->propVals[y][z] && !sharedOp[z] && !(op->binidmatters[z] && op->binid[z])) {
+								if(!nonzero) {
+									nonzero = true;
+									cout << "\t\t\t";
+								}
+								cout << "binary[" << z << "] = ";
+							}
+						}
+						if(nonzero) {
+							cout << "inst->operands[" << rid << "]->properties & ";
+							switch(propval) {
+								case prop_minus:
+									cout << "prop_minus";
+									break;
+								case prop_not:
+									cout << "prop_not";
+									break;
+								case prop_bitwise_complement:
+									cout << "prop_bitwise_complement";
+									break;
+								case prop_absolute_value:
+									cout << "prop_absolute_value";
+									break;
+								default:
+									cout << "(operand_prop)" << propval;
+							}
+							cout << ";\n";
+						}						
+						
+						nonzero = false;
+						for(int z = 0; z < 64; z++) {
+							if(rand->propMatters[y][z] && !rand->propVals[y][z] && !sharedOp[z] && !(op->binidmatters[z] && op->binid[z])) {
+								if(!nonzero) {
+									nonzero = true;
+									cout << "\t\t\t";
+								}
+								cout << "binary[" << z << "] = ";
+							}
+						}
+						if(nonzero) {
+							cout << "!(inst->operands[" << rid << "]->properties & ";
+							switch(propval) {
+								case prop_minus:
+									cout << "prop_minus";
+									break;
+								case prop_not:
+									cout << "prop_not";
+									break;
+								case prop_bitwise_complement:
+									cout << "prop_bitwise_complement";
+									break;
+								case prop_absolute_value:
+									cout << "prop_absolute_value";
+									break;
+								default:
+									cout << "(operand_prop)" << propval;
+							}
+							cout << ");\n";
+						}
+					}
+					propval *= 2;
+				}
+				
+				if(!canShareRand[rid]) {
+					int start1 = -1;
+					int start2 = -1;
+					int start3 = -1;
+				
+					for(int x = 0; x < 64; x++) {
+						if(rand->components & 1) {
+							string postPend = "";
+							if(rand->possibleStart1[x]) {
+								if(start1 >= 0) {
+									// cerr << "WARNING: operand[" << rid << "]->val1 with multiple starts in " << opcodes[opid] << " (" << start1 << " vs " << x << ").\n";
+								}
+								start1 = x;
+								if(rand->relative) {
+									postPend = " - (inst->size + inst->address)";
+								} else if(rand->addlNegative) {
+									if(rand->decimal) {
+										postPend.append(" ^ (0x1 << ");
+										ostringstream temp;
+										temp << (rand->maxBits1[start1]);
+										postPend.append(temp.str());
+										postPend.append(")");
+									} else {
+										postPend = " * -1";
+									}
+								}
+							
+								cout << "\t\t\tfor(int randsize = 0; randsize < " << rand->maxBits1[start1] << "; randsize++) {\n";
+								if(rand->incNegative && !rand->relative) {
+									if(rand->decimal) {
+										cout << "\t\t\t\tbinary[randsize + " << start1 << "] = ((inst->operands[" << rid << "]->val1 ^ (";
+										cout << "(inst->operands[" << rid << "]->properties & prop_minus ? 1 : 0)";
+										cout << " << " << rand->maxBits1[start1] << ")) & (0x1 << randsize));\n";
+									} else {
+										cout << "\t\t\t\tbinary[randsize + " << start1 << "] = ((inst->operands[" << rid << "]->val1 * ";
+										cout << "(inst->operands[" << rid << "]->properties & prop_minus ? -1 : 1)";
+										cout << ") & (0x1 << randsize));\n";
+									}
+								} else {
+									cout << "\t\t\t\tbinary[randsize + " << start1 << "] = ((inst->operands[" << rid << "]->val1" << postPend << ") & (0x1 << randsize));\n";
+								}
+								cout << "\t\t\t}\n";
+					
+								for(int x = start1; x < start1 + rand->maxBits1[start1]; x++) {
+									operandBits[x] = true;
+								}
+							}
+						}
+						if(rand->components & 2) {
+							if(rand->possibleStart2[x]) {
+								if(start2 >= 0) {
+									// cerr << "WARNING: operand[" << rid << "]->val2 with multiple starts in " << opcodes[opid] << " (" << start2 << " vs " << x << ").\n";
+								}
+								start2 = x;
+								cout << "\t\t\tfor(int randsize = 0; randsize < " << rand->maxBits2[start2] << "; randsize++) {\n";
+								cout << "\t\t\t\tbinary[randsize + " << start2 << "] = (inst->operands[" << rid << "]->val2 & (0x1 << randsize));\n";
+								cout << "\t\t\t}\n";
+							
+								for(int x = start2; x < start2 + rand->maxBits2[start2]; x++) {
+									operandBits[x] = true;
+								}
+							}
+						}
+						if(rand->components & 4) {
+							if(rand->possibleStart3[x]) {
+								if(start3 >= 0) {
+									// cerr << "WARNING: operand[" << rid << "]->val3 with multiple starts in " << opcodes[opid] << " (" << start3 << " vs " << x << ").\n";
+								}
+								start3 = x;
+								if(rand->shiftComp3) {
+									cout << "\t\t\tfor(int randsize = 0; randsize < " << rand->maxBits3[start3] << "; randsize++) {\n";
+									cout << "\t\t\t\tbinary[randsize + " << start3 << "] = (inst->operands[" << rid << "]->val3 & (0x1 << (randsize + 2)));\n";
+									cout << "\t\t\t}\n";
+								} else {
+									cout << "\t\t\tfor(int randsize = 0; randsize < " << rand->maxBits3[start3] << "; randsize++) {\n";
+									cout << "\t\t\t\tbinary[randsize + " << start3 << "] = (inst->operands[" << rid << "]->val3 & (0x1 << randsize));\n";
+									cout << "\t\t\t}\n";
+								}
+							
+								for(int x = start3; x < start3 + rand->maxBits3[start3]; x++) {
+									operandBits[x] = true;
+								}
+							}
+						}
+					}
+				
+					if(rand->components & 1) {
+						if(start1 < 0) {
+							cout << "\t\t\t//TODO: add manual code for " << opcodes[opid] << "[" << rid << "]\n";
+							// cerr << "WARNING: operand[" << rid << "]->val1 without possible start in " << opcodes[opid] << ".\n";
+							// cerr << "WARNING: clarification; operands are ";
+							// for(int ops2 = 0; ops2 < op->numOperands; ops2++) {
+								// if(op->operands[ops2]->type == type_sb) {
+									// cerr << "sb, ";
+								// } else if(op->operands[ops2]->type == type_hex) {
+									// cerr << "hex, ";
+								// } else if(op->operands[ops2]->type == type_register) {
+									// cerr << "register, ";
+								// } else if(op->operands[ops2]->type == type_predicate) {
+									// cerr << "predicate, ";
+								// } else if(op->operands[ops2]->type == type_const_mem) {
+									// cerr << "const, ";
+								// } else if(op->operands[ops2]->type == type_mem) {
+									// cerr << "mem, ";
+								// } else if(op->operands[ops2]->type == type_texture_operand) {
+									// cerr << "texture, ";
+								// } else if(op->operands[ops2]->type == type_special_reg) {
+									// cerr << "special, ";
+								// } else {
+									// cerr << "???, ";
+								// }
+							// }
+							// cerr << "\n";
+							continue;
+						}
+					}
+					if(rand->components & 2) {
+						if(start2 < 0) {
+							cout << "\t\t\t//TODO: add manual code for " << opcodes[opid] << "[" << rid << "]\n";
+							// cerr << "WARNING: operand[" << rid << "]->val2 without possible start in " << opcodes[opid] << ".\n";
+							// if(rand->type == type_hex) {
+								// cerr << "hex";
+							// } else if(rand->type == type_register) {
+								// cerr << "register";
+							// } else if(rand->type == type_predicate) {
+								// cerr << "predicate";
+							// } else if(rand->type == type_const_mem) {
+								// cerr << "const";
+							// } else if(rand->type == type_mem) {
+								// cerr << "mem";
+							// } else {
+								// cerr << "????";
+							// }
+							// cerr << "\n";
+							continue;
+						}
+					}
+					if(rand->components & 4) {
+						if(start3 < 0) {
+							cout << "\t\t\t//TODO: add manual code for " << opcodes[opid] << "[" << rid << "]\n";
+							// cerr << "WARNING: operand[" << rid << "]->val3 without possible start in " << opcodes[opid] << ".\n";
+							// if(rand->type == type_hex) {
+								// cerr << "hex";
+							// } else if(rand->type == type_register) {
+								// cerr << "register";
+							// } else if(rand->type == type_predicate) {
+								// cerr << "predicate";
+							// } else if(rand->type == type_const_mem) {
+								// cerr << "const";
+							// } else if(rand->type == type_mem) {
+								// cerr << "mem";
+							// } else {
+								// cerr << "????";
+							// }
+							// cerr << "\n";
+							continue;
+						}
+					}
+				}
+			}
+			
+			//Prepare to deal with uncombinable mods:
+			bool uncombinableMods = false;
+			bool firstUncombinableMod = false;
+			
+			//Deal with default values for flags:
+			node * mods = op->mods;
+			while(mods) {
+				operationMod * mod = (operationMod*) mods->value;
+				if(!mod->combine) {
+					firstUncombinableMod = true;
+					uncombinableMods = true;
+					if(mod->type == MOD_FLAG) {
+						if(mod->seenAntiVal) {
+							for(int bit = 0; bit < 64; bit++) {
+								if(!sharedOp[bit] && !op->binidmatters[bit] && !operandBits[bit] && mod->matters[bit] && mod->antivals[bit] && !mod->vals[bit]) {
+									cout << "\t\t\tbinary[" << bit << "] = true;\n";
+								}
+							}
+						}
+					}
+				}
+				mods = mods->next;
+			}
+			//TODO: operand flag mods
+			
+			if(firstUncombinableMod || !operations[opid]->next) {
+				firstUncombinableMod = true;
+				uncombinableMods = true;
+				cout << "\t\t\tnode * mods = inst->mods;\n";
+				cout << "\t\t\twhile(mods) {\n";
+		
+				mods = op->mods;
+				while(mods) {
+					operationMod * mod = (operationMod*) mods->value;
+					if(!mod->combine || !operations[opid]->next) {
+						if(firstUncombinableMod) {
+							cout << "\t\t\t\t";
+							firstUncombinableMod = false;
+						} else {
+							cout << " else ";
+						}
+					
+						seenModType[mod->type] = true;
+						if(modOrderMatters[mod->type]) {
+							if(mod->count) {
+								cout << "if(!strcmp((char*)mods->value, \"" << mod->token << "\")" << " && seenModType[" << mod->type << "]) {\n";
+							} else {
+								cout << "if(!strcmp((char*)mods->value, \"" << mod->token << "\")" << " && !seenModType[" << mod->type << "]) {\n";
+								cout << "\t\t\t\t\tseenModType[" << mod->type << "] = true;\n";
+							}
+						} else {
+							cout << "if(!strcmp((char*)mods->value, \"" << mod->token << "\")) {\n";
+						}
+					
+						for(int bit = 0; bit < 64; bit++) {
+							if(!op->binidmatters[bit] && !operandBits[bit] && !sharedOp[bit]) {
+								if(mod->matters[bit] && mod->vals[bit]) {
+									if(mod->type != MOD_FLAG || !mod->antivals[bit]) {
+										cout << "\t\t\t\t\tbinary[" << bit << "] = true;\n";
+									}
+								} else if(mod->seenAntiVal && mod->matters[bit] && mod->antivals[bit] && !mod->vals[bit] && mod->type == MOD_FLAG) {
+									cout << "\t\t\t\t\tbinary[" << bit << "] = false;\n";
+								} else if(mod->matters[bit] && !mod->vals[bit]) {
+									//cout << "\t\t\t\t\tbinary[" << bit << "] = false;\n";
+								}
+							}
+						}
+						cout << "\t\t\t\t}";
+					}
+					mods = mods->next;
+				}
+				if(!operations[opid]->next) {
+					if(!firstUncombinableMod) {
+						cout << " else {\n";
+						cout << "\t\t\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction " << opcodes[opid] << ".\\n\";\n";
+						cout << "\t\t\t\t}\n";
+					} else {
+						cout << "\t\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction " << opcodes[opid] << ".\\n\";\n";
+					}
+				}
+				cout << "\n";
+				cout << "\t\t\t\tmods = mods->next;\n";
+				cout << "\t\t\t}\n";
+			}
+			
+			for(int modType = 1; modType < NUM_MOD_TYPES; modType++) {
+				if(seenModType[modType]) {
+					int bitSum = 0;
+					int bitSum2 = 0;
+					for(int x = 0; x < 64; x++) {
+						if(op->noModBits[modType][x]) {
+							bitSum++;
+							if(!sharedOp[x]) {
+								bitSum2++;
+							}
+						}
+					}
+					if(bitSum == 64 || bitSum == 0 || bitSum2 == 0) {
+						continue;
+					}
+				
+					cout << "\t\t\tif(!seenModType[" << modType << "]) {\n";
+					for(int x = 0; x < 64; x++) {
+						if(op->noModBits[modType][x] && !sharedOp[x]) {
+							cout << "\t\t\t\tbinary[" << x << "] = true;\n";
+						}
+					}
+					cout << "\t\t\t}\n";
+				}
+			}
+			
+			//Deal with operand mods:
+			for(int rid = 0; rid < checkMods; rid++) {
+				cout << "\t\t\t";
+				if(rid == 0 && !uncombinableMods) {
+					cout << "node * ";
+				}
+				cout << "mods = inst->operands[" << rid << "]->mods;\n";
+				cout << "\t\t\twhile(mods) {\n";
+				node * mods = op->operands[rid]->mods;
+				bool firstMod = true;
+				while(mods) {
+					operationMod * mod = (operationMod*) mods->value;
+					if(!strcmp(mod->token, "reuse")) {
+						mods = mods->next;
+						continue;
+					}
+					
+					if(firstMod) {
+						cout << "\t\t\t\t";
+					} else {
+						cout << " else ";
+					}
+					
+					firstMod = false;
+					
+					cout << "if(!strcmp((char*)mods->value, \"" << mod->token << "\")) {\n";
+					for(int bit = 0; bit < 64; bit++) {
+						if(!sharedOp[bit] && !operandBits[bit] && !(op->binidmatters[bit] && op->binid[bit]) && mod->matters[bit] && mod->vals[bit]) {
+							cout << "\t\t\t\t\tbinary[" << bit << "] = true;\n";
+						} else if(mod->seenAntiVal && mod->matters[bit] && mod->antivals[bit] && !mod->vals[bit] && mod->type == MOD_FLAG) {
+							cout << "\t\t\t\t\tbinary[" << bit << "] = false;\n";
+						}
+					}
+					cout << "\t\t\t\t}";
+					mods = mods->next;
+				}
+				if(!firstMod) {
+					if(_arch < 50) {
+						cout << " else {\n";
+					} else {
+						cout << " else if(strcmp((char*)mods->value, \"reuse\")) {\n";
+					}
+					cout << "\t\t\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction " << opcodes[opid] << ":" << rid << ".\\n\";\n";
+					cout << "\t\t\t\t}\n";
+				} else {
+					cout << "\t\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction " << opcodes[opid] << ":" << rid << ".\\n\";\n";
+				}
+				cout << "\t\t\t\tmods = mods->next;\n";
+				cout << "\t\t\t}\n";
+			}
+			
+			cout << "\t\t}";
+			ops = ops->next;
+		}
+		
+		if(operations[opid]) {
+			cout << " else {\n";
+			cout << "\t\t\tcerr << \"ERROR: Unrecognized operand list for instruction " << opcodes[opid] << ".\\n\";\n";
+			cout << "\t\t}\n";
+		}
+		
+		//Deal with combinable mods:
+		if(operations[opid] && operations[opid]->next) {
+			operation * op = (operation*) (operations[opid]->value);
+			
+			//Deal with default values for flags:
+			node * mods = op->mods;
+			while(mods) {
+				operationMod * mod = (operationMod*) mods->value;
+				if(mod->combine) {
+					if(mod->type == MOD_FLAG) {
+						if(mod->seenAntiVal) {
+							for(int bit = 0; bit < 64; bit++) {
+								if(!sharedOp[bit] && !(op->binidmatters[bit] && op->binid[bit]) && !alwaysOperandBits[bit] && mod->matters[bit] && mod->antivals[bit] && !mod->vals[bit]) {
+									cout << "\t\tbinary[" << bit << "] = true;\n";
+								}
+							}
+						}
+					}
+				}
+				mods = mods->next;
+			}
+			
+			cout << "\t\tnode * mods = inst->mods;\n";
+			cout << "\t\twhile(mods) {\n";
+			
+			mods = op->mods;
+			while(mods) {
+				if(mods == op->mods) {
+					cout << "\t\t\t";
+				} else {
+					cout << " else ";
+				}
+				
+				operationMod * mod = (operationMod*) mods->value;
+				seenModType[mod->type] = true;
+				if(modOrderMatters[mod->type] && mod->combine) {
+					if(mod->count) {
+						cout << "if(!strcmp((char*)mods->value, \"" << mod->token << "\")" << " && seenModType[" << mod->type << "]) {\n";
+					} else {
+						cout << "if(!strcmp((char*)mods->value, \"" << mod->token << "\")" << " && !seenModType[" << mod->type << "]) {\n";
+						cout << "\t\t\t\tseenModType[" << mod->type << "] = true;\n";
+					}
+				} else {
+					cout << "if(!strcmp((char*)mods->value, \"" << mod->token << "\")) {\n";
+				}
+				
+				if(mod->combine) {
+					for(int bit = 0; bit < 64; bit++) {
+						if(!sharedOp[bit] && !alwaysOperandBits[bit] && mod->matters[bit] && mod->vals[bit]) {
+							if(mod->type != MOD_FLAG || !mod->antivals[bit]) {
+								cout << "\t\t\t\tbinary[" << bit << "] = true;\n";
+							}
+						} else if(mod->seenAntiVal && mod->matters[bit] && mod->antivals[bit] && !mod->vals[bit] && mod->type == MOD_FLAG) {
+							cout << "\t\t\t\tbinary[" << bit << "] = false;\n";
+						} else if(unsharedOp[bit] && mod->matters[bit] && !mod->vals[bit]) {
+							cout << "\t\t\t\tbinary[" << bit << "] = false;\n";
+						}
+					}
+				}
+				cout << "\t\t\t}";
+				mods = mods->next;
+			}
+			if(op->mods) {
+				cout << " else {\n";
+				cout << "\t\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction " << opcodes[opid] << ".\\n\";\n";
+				cout << "\t\t\t}\n";
+			} else {
+				cout << "\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction " << opcodes[opid] << ".\\n\";\n";
+			}
+			cout << "\t\t\tmods = mods->next;\n";
+			cout << "\t\t}\n";
+		}
+		
+		cout << "\t}";
+		if(!opcodes[opid+1]) {
+			cout << " else if(opcode_BINCODE != inst->op) {\n";
+			cout << "\t\tcerr << \"ERROR: Unimplemented instruction: \" << opcodes[inst->op] << \".\\n\";\n";
+			cout << "\t}\n";
+			cout << "\n";
+		}
+	}
+	
+	cout << "\n";
+	cout << "\tif(canGuard) {\n";
+	cout << "\t\tif(inst->guard) {\n";
+	cout << "\t\t\tfor(int x = 0; x < 3; x++) {\n";
+	cout << "\t\t\t\tbinary[x+guardLoc] = inst->guard->val1 & (0x1 << x);\n";
+	cout << "\t\t\t}\n";
+	cout << "\t\t\tif(inst->guard->properties & prop_not) {\n";
+	cout << "\t\t\t\tbinary[guardLoc + 3] = 1;\n";
+	cout << "\t\t\t}\n";
+	cout << "\t\t} else {\n";
+	cout << "\t\t\tbinary[guardLoc] = binary[guardLoc + 1] = binary[guardLoc + 2] = 1;\n";
+	cout << "\t\t\tbinary[guardLoc + 3] = 0;\n";
+	cout << "\t\t}\n";
+	cout << "\t}\n";
+	
+	cout << "\n";
+	cout << "\tfor(int x = checkrandmods; x < inst->num_operands; x++) {\n";
+	cout << "\t\tnode * mods = inst->operands[x]->mods;\n";
+	cout << "\t\twhile(mods) {\n";
+	if(_arch < 50) {
+		cout << "\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction \" << opcodes[inst->op] << \".\\n\";\n";
+	} else {
+		cout << "\t\t\tif(strcmp((char*)mods->value, \"reuse\")) {\n";
+		cout << "\t\t\t\tcerr << \"ERROR: Unrecognized mod \" << (char*) mods->value << \" for instruction \" << opcodes[inst->op] << \".\\n\";\n";
+		cout << "\t\t\t}\n";
+	}
+	cout << "\t\t\tmods = mods->next;\n";
+	cout << "\t\t}\n";
+	cout << "\t}\n";
+}
+
+/**
+ * Outputs bit-flipped code to stdout.
+ * This should be injected into an executable and then turned back into assembly+binary with our other tools.
+ */
+void outputProbeCode() {
+	printfMetadata();
+	
+	int low = 0;
+	int high = 64;
+	int schialign = 8;
+	if((_arch > 30 && _arch < 50)) {
+		low = 2;
+		high = 54;
+	} else if((_arch >= 50 && _arch < 70)) {
+		high = 51;
+		schialign = 4;
+	}
+	
+	int num = 0;
+	bool * arbitraryValidCode = 0;
+	for(int opid = 0; ; opid++) {
+		int currentAlign = 0;
+		if(!opcodes[opid]) {
+			break;
+		} else if(opid == opcode_SCHI) {
+			//currentAlign = schialign;
+			continue;
+		}
+		
+		node * ops = operations[opid];
+		while(ops) {
+			operation * op = (operation*) ops->value;
+			
+			if((_arch > 30 && _arch < 50) && opid == opcode_BAR) {
+				//TODO?
+				ops = ops->next;
+				continue;
+			}
+			
+			int temphigh = high;
+			int templow = low;
+			
+			//Print out original instruction's code:
+			while(true) {
+				cout << "BINCODE.";
+				if(!currentAlign || (num % currentAlign == 0)) {
+					arbitraryValidCode = op->binid;
+					for(int y = 0; y < 64; y++) {
+						cout << op->binid[y];
+					}
+					cout << " ; //" << opcodes[opid] << "\n";
+					num++;
+					break;
+				} else {
+					for(int y = 0; y < 64; y++) {
+						cout << "0";
+					}
+					cout << " ;\n";
+				}
+				num++;
+			}
+			
+			
+			if((_arch > 30 && _arch < 50) && opid == opcode_R2P) {
+				temphigh = 52;
+			} else if((_arch > 30 && _arch < 50) && opid == opcode_LDC) {
+				temphigh = 58;
+			} else if((_arch > 30 && _arch < 50)) {
+				for(int x = 0; x < op->numOperands; x++) {
+					if(op->operands[x]->type == type_const_mem) {
+						if(op->numOperands > 3 && x == op->numOperands - 1) {
+							temphigh = 55;
+						} else {
+							temphigh = 56;
+						}
+						break;
+					}
+				}
+			}
+			
+			if((_arch >= 50 && _arch < 70) && opid == opcode_BAR) {
+				temphigh = 30;
+			} else if((_arch >= 50 && _arch < 70) && (opid == opcode_TEXS || opid == opcode_TLDS || opid == opcode_ST)) {
+				temphigh = 58;
+			}
+		
+			for(int x = templow; x < temphigh; x++) {
+				cout << "BINCODE.";
+				if(!currentAlign || (num % currentAlign == 0)) {
+					for(int y = 0; y < 64; y++) {
+						if(x == y) {
+							cout << !op->binid[y];
+						} else {
+							cout << op->binid[y];
+						}
+					}
+				} else {
+					for(int y = 0; y < 64; y++) {
+						cout << "0";
+					}
+					x--;
+				}
+				cout << " ;\n";
+				num++;
+			}
+			ops = ops->next;
+		}
+	}
+	
+	while(num % (schialign - 1)) {
+		num++;
+		cout << "BINCODE.";
+		for(int y = 0; y < 64; y++) {
+			cout << arbitraryValidCode[y];
+		}
+		cout << " ;\n";
+	}
+}
+
+int main(int argc, char ** argv) {
+	int index_input = 0;//index in argv of input file name
+	bool finalout = false;
+	
+	//Read arguments:
+	int x;
+	for(x = 1; x < argc; x++) {
+		if(!strcasecmp(argv[x],"-final")) {
+			finalout = true;
+		} else if(!strcasecmp(argv[x], "-probe")) {
+			probe = true;
+		} else if(!strcasecmp(argv[x],"-h")) {
+			index_input = -1;
+			break;
+		} else if(!strcasecmp(argv[x],"-help")) {
+			index_input = -1;
+			break;
+		} else if(!index_input) {
+			index_input = x;
+		} else {
+			fprintf(stderr,"ERROR: invalid arguments.\n");
+			return 1;
+		}
+	}
+	
+	if(index_input < 0) {
+		cerr << "Persistent data is delivered through standard in.\n";
+		cerr << "Usage: " << argv[0] << " [options] <input-file>\n";
+		cerr << "Options:\n";
+		cerr << "-probe\n";
+		cerr << "Generate bit-flip code.\n";
+		cerr << "-final\n";
+		cerr << "Generate assembler code.\n";
+		cerr << "-h, -help\n";
+		cerr << "\tDisplay this help, and then exit.\n";
+		return 0;
+	}
+	
+	//Some initialization
+	for(int x = 0; x < MAX_OPERATIONS; x++) {
+		operations[x] = 0;
+	}
+	
+	inputData();
+	
+	if(index_input) {
+		//Set input source:
+		yyin = fopen(argv[index_input], "r");
+		
+		//Check if input file exists:
+		if(!yyin) {
+			fprintf(stderr,"ERROR: requires valid input file.\n");
+			return 0;
+		}
+		
+		//Parse input file:
+		yyparse();
+		
+		//Cleanup after parsing:
+		fclose(yyin);
+		yylex_destroy();
+	}
+	
+	if(finalout) {
+		outputTranslations();
+	} else if(probe) {
+		_num_functions = 0;
+		outputProbeCode();
+	} else {
+		outputData();
+	}
+	
+	//cerr << "Program finished execution without crashing.\n";
+	return 0;
+}
+
