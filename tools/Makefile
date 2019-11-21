@@ -51,7 +51,7 @@ else
 	endif
 endif
 
-default: bin2asm asm2bin decode
+default:$(shell mkdir -p "objs") bin2asm asm2bin decode
 
 debug: CFLAGS += -g -O0
 debug: default
