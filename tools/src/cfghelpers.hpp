@@ -2,6 +2,9 @@
 #define CFGHELPERS_HPP
 #include "common.hpp"
 #include <vector>
+#include <stack>
+#include <utility>
+using namespace std;
 
 /**
  * @file cfghelpers.hpp
@@ -78,38 +81,6 @@ void fixAssembly();
 void propogateBranches(blockEnd branch_type);
 
 /**
- * Helper for propogatePrebreaks.
- * Recursively adds successors to blocks that end with a BRK.
- * @param search The current block in which we're searching for a BRK
- * @param target The address to jump to after a BRK
- * @param tag A unique value to avoid infinite recursion
- * @return true iff changes were made
- */
-bool propogateBreaks(blockNode * search, int target, int tag);
-
-/**
- * Adds successors for blocks that end with a BRK.
- * @return true iff changes were made
- */
-bool propogatePrebreaks();
-
-/**
- * Helper for propogatePrecontinues.
- * Recursively adds successors to blocks that end with a CONT.
- * @param search The current block in which we're searching for a CONT
- * @param target The address to jump to after a CONT
- * @param tag A unique value to avoid infinite recursion
- * @return true iff changes were made
- */
-bool propogateContinues(blockNode * search, int target, int tag);
-
-/**
- * Adds successors to blocks that end with a CONT.
- * @return true iff changes were made, false otherwise
- */
-bool propogatePrecontinues();
-
-/**
  * Helper for propogateCallReturns.
  * Recursively adds successors to blocks that end with a RET.
  * @param search The current block in which we're searching for a RET
@@ -126,20 +97,20 @@ bool propogateReturns(blockNode * search, int target, int tag);
 bool propogateCallReturns();
 
 /**
- * Adds branches to "OPCODE.S" or SYNC instructions, based on SSY values
- * @param search The current block in which we're searching for SSY and SYNC/.S
- * @param stack The list of unused SSY values along this path so far
+ * Adds pointers based on thread divergence, break, and continue instructions.
+ * @param search The current block in which we're searching for SSY/.S|SYNC, PBK/BRK, and PCNT/CONT
+ * @param ptrs A stack of pointers, as <opcode, address> pairs
  * @param tag A unique value used to avoid double visiting any blocks
  * @param firstCall True iff at depth 0 of recursion
  * @return true iff changes were made, false otherwise
  */
-bool propogateSSYHelper(blockNode * search, node * stack, int tag, bool firstCall);
+bool propogatePointersHelper(blockNode * search, stack<pair<opcode, long long> > ptrs, int tag, bool firstCall);
 
 /**
- * Adds branches to "OPCODE.S" or SYNC instructions, based on SSY values
+ * Adds pointers based on thread divergence, break, and continue instructions.
  * @return true iff changes were made, false otherwise
  */
-bool propogateSSY();
+bool propogatePointers();
 
 /**
  * Sets target blocks for relevant instructions.

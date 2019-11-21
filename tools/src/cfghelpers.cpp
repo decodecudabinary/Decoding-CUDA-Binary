@@ -678,208 +678,6 @@ void propogateBranches(blockEnd branch_type) {
 	}
 }
 
-bool propogateBreaks(blockNode * search, int target, int tag) {
-	if(search->tag == tag) {
-		return false;
-	}
-	else {
-		search->tag = tag;
-	}
-	
-	bool changed = false;
-	if(search->guarded) {
-		blockNode * next = getBlock(search->last + 1);
-		changed = changed || propogateBreaks(next, target, tag);
-	}
-	
-	//Search for break inside search block:
-	instruction * inst;
-	node * j;
-	j = search->instructions;
-	while(j) {
-		inst = (instruction*) j->value;
-		if(inst->op == opcode_PBK) {//pre-break value has changed
-			return changed;
-		}
-		else if(inst->op == opcode_BRK) {//end of path; found a break
-			changed = changed || addBranchToAddress(search, target);
-			return changed;
-		}
-		j = j->next;
-	}
-	
-	//Search successors:
-	if(search->end == end_generic || search->end == end_call) {
-		j = search->forward;
-		while(j) {
-			changed = changed || propogateBreaks((blockNode*)j->value, target, tag);
-			j = j->next;
-		}
-	}
-	if(search->end == end_branch) {
-		j = search->branches;
-		while(j) {
-			changed = changed || propogateBreaks((blockNode*)j->value, target, tag);
-			j = j->next;
-		}
-	}
-	
-	return changed;
-}
-
-bool propogatePrebreaks() {
-	blockNode * a;
-	instruction * inst;
-	node * j;
-	node * i = _blocks;
-	bool changed = false;
-	
-	while(i) {
-		a = (blockNode*) i->value;//current block being searched for pre-breaks
-		
-		int pbk = 0;
-		j = a->instructions;
-		while(j) {
-			inst = (instruction*) j->value;//current instruction being checked for pre-break
-			
-			if(inst->op == opcode_PBK) {//pre-break found
-				pbk = inst->operands[0]->val1;
-			}
-			else if(inst->op == opcode_BRK) {//break found
-				if(pbk) {//pre-break value was set in this block
-					changed = changed || addBranchToAddress(a, pbk);
-					pbk = 0;
-					break;
-				}
-			}
-			j = j->next;
-		}
-		
-		if(pbk) {//the block contains a pre-break
-			//Search successors for breaks:
-			if(a->end == end_generic || a->end == end_call) {
-				j = a->forward;
-				while(j) {
-					changed = changed || propogateBreaks((blockNode*)j->value, pbk, ++_tag);
-					j = j->next;
-				}
-			}
-			if(a->end == end_branch) {
-				j = a->branches;
-				while(j) {
-					changed = changed || propogateBreaks((blockNode*)j->value, pbk, ++_tag);
-					j = j->next;
-				}
-			}
-		}
-		
-		i = i->next;
-	}
-	
-	return changed;
-}
-
-bool propogateContinues(blockNode * search, int target, int tag) {
-	if(search->tag == tag) {//already searched here
-		return false;
-	}
-	else {
-		search->tag = tag;
-	}
-	
-	bool changed = false;
-	if(search->guarded) {
-		blockNode * next = getBlock(search->last + 1);
-		changed = changed || propogateContinues(next, target, tag);
-	}
-	
-	//Search instructions for continues:
-	instruction * inst;
-	node * j;
-	j = search->instructions;
-	while(j) {
-		inst = (instruction*) j->value;
-		if(inst->op == opcode_PCNT) {//pre-continue value has changed
-			return changed;
-		}
-		else if(inst->op == opcode_CONT) {//continue found; end of path
-			changed = changed || addBranchToAddress(search, target);
-			return changed;
-		}
-		j = j->next;
-	}
-	
-	//Search successors for continues:
-	if(search->end == end_generic || search->end == end_call) {
-		j = search->forward;
-		while(j) {
-			changed = changed || propogateContinues((blockNode*)j->value, target, tag);
-			j = j->next;
-		}
-	}
-	if(search->end == end_branch) {
-		j = search->branches;
-		while(j) {
-			changed = changed || propogateContinues((blockNode*)j->value, target, tag);
-			j = j->next;
-		}
-	}
-	
-	return changed;
-}
-
-bool propogatePrecontinues() {
-	blockNode * a;
-	instruction * inst;
-	node * j;
-	node * i = _blocks;
-	bool changed = false;
-	
-	while(i) {
-		a = (blockNode*) i->value;//current block being checked
-		
-		int pcnt = 0;
-		j = a->instructions;
-		while(j) {
-			inst = (instruction*) j->value;//current instruction being checked
-			
-			if(inst->op == opcode_PCNT) {//pre-continue found
-				pcnt = inst->operands[0]->val1;
-			}
-			else if(inst->op == opcode_CONT) {//continue found
-				if(pcnt) {//pre-continue was set inside this block
-					changed = changed || addBranchToAddress(a, pcnt);
-					pcnt = 0;
-					break;
-				}
-			}
-			j = j->next;
-		}
-		
-		if(pcnt) {//the block contains a pre-continue
-			//Search successors for continues:
-			if(a->end == end_generic || a->end == end_call) {
-				j = a->forward;
-				while(j) {
-					changed = changed || propogateContinues((blockNode*)j->value, pcnt, ++_tag);
-					j = j->next;
-				}
-			}
-			if(a->end == end_branch) {
-				j = a->branches;
-				while(j) {
-					changed = changed || propogateContinues((blockNode*)j->value, pcnt, ++_tag);
-					j = j->next;
-				}
-			}
-		}
-		
-		i = i->next;
-	}
-	
-	return changed;
-}
-
 bool propogateReturns(blockNode * search, int target, int tag) {
 	search->tag = tag;
 	bool changed = false;
@@ -960,7 +758,7 @@ bool propogateCallReturns() {
 	return changed;
 }
 
-bool propogateSSYHelper(blockNode * search, node * stack, int tag, bool firstCall) {
+bool propogatePointersHelper(blockNode * search, stack<pair<opcode, long long> > ptrs, int tag, bool firstCall) {
 	if(search->tag == tag) {
 		return false;
 	}
@@ -971,75 +769,85 @@ bool propogateSSYHelper(blockNode * search, node * stack, int tag, bool firstCal
 	bool changed = false;
 	if(search->guarded) {
 		blockNode * next = getBlock(search->last + 1);
-		changed = changed || propogateSSYHelper(next, stack, tag, false);
+		changed = changed || propogatePointersHelper(next, ptrs, tag, false);
 	}
 	
-	int addedSSY = 0;
-	//bool shrunkStack = false;
+	int addedPtrs = 0;
 	
 	node * iter = search->instructions;
 	while(iter) {
 		instruction * inst = (instruction*) iter->value;//current instruction being checked
-		if(inst->op == opcode_SSY) {//SSY found
+		if(inst->op == opcode_SSY || inst->op == opcode_PBK || inst->op == opcode_PCNT) {
 			long long target = inst->operands[0]->val1;
-			addFirst(&stack, (void*)target);
-			addedSSY++;
-		}
-		else if(stack && (hasMod(inst, "S") || inst->op == opcode_SYNC)) {
-			long long target = (long long)stack->value;
-			if(addedSSY) {
-				addedSSY--;
-				node * temp = stack->next;
-				free(stack);
-				stack = temp;
-			} else {
-				//shrunkStack = true;
-				stack = stack->next;
+			ptrs.push(make_pair(inst->op, target));
+			addedPtrs++;
+		} else if(!ptrs.empty()) {
+			opcode mustMatch = opcode_NOP;
+			if(hasMod(inst, "S") || inst->op == opcode_SYNC) {//mod S is used prior to arch 50
+				mustMatch = opcode_SSY;
 			}
-			changed = changed || addBranchToAddress(search, target);
+			else if(inst->op == opcode_CONT) {
+				mustMatch = opcode_PCNT;
+			}
+			else if(inst->op == opcode_BRK) {
+				mustMatch = opcode_PBK;
+			}
+			if(mustMatch != opcode_NOP) {
+				//look for desired instruction in stack:
+				pair<opcode, long long> targetPair = ptrs.top();
+				ptrs.pop();
+				while(targetPair.first != mustMatch && !ptrs.empty()) {
+					targetPair = ptrs.top();
+					ptrs.pop();
+				}
+				//if found desired instruction, match it to this jump
+				if(targetPair.first == mustMatch) {
+					long long target = targetPair.second;
+					if(addedPtrs) {
+						addedPtrs--;
+					}
+					changed = changed || addBranchToAddress(search, target);
+				}
+			}
 		}
 		iter = iter->next;
 	}
 	
-	if(stack) {
+	if(!ptrs.empty()) {
 		node * children = 0;
-		if(search->end == end_generic || search->end == end_call) {//TODO: verify whether SSY from one subroutine can legally converge from inside another nested subroutine
+		if(search->end == end_generic || search->end == end_call) {
 			children = search->forward;
-		}
-		else if(search->end == end_branch) {
+		} else if(search->end == end_branch) {
 			children = search->branches;
 		} else if(search->end == end_return) {
-			static bool seenError = false;
-			if(!seenError) {
-				cerr << "SANITY CHECK ERROR ch~976; threads fail to re-converge:\n";
-				cerr << "\t The code's subroutines have divergent threads that fail to converge;\n";
-				cerr << "\t The compiler you used to generate this GPU code may have errors.\n";
-				seenError = true;
+			static bool subroutineWarning = false;
+			if(!subroutineWarning) {
+				cerr << "Warning ch~976; subroutine may modify the pointer stack\n";
+				subroutineWarning = true;
 			}
 		}
 		while(children) {
-			changed = changed || propogateSSYHelper((blockNode*)children->value, stack, tag, false);
+			changed = changed || propogatePointersHelper((blockNode*)children->value, ptrs, tag, false);
 			children = children->next;
 		}
 	}
 	
 	//Garbage removal:
-	while(addedSSY) {
-		addedSSY--;
-		node * temp = stack->next;
-		free(stack);
-		stack = temp;
+	while(addedPtrs) {
+		addedPtrs--;
+		ptrs.pop();
 	}
 	
 	return changed;
 }
 
-bool propogateSSY() {
+bool propogatePointers() {
 	node * blocks = _blocks;
 	bool changed = false;
+	stack<pair<opcode, long long> > ptrs;
 	while(blocks) {
 		blockNode * block = (blockNode*) blocks->value;//current block being checked
-		changed = changed || propogateSSYHelper(block, 0, ++_tag, true);
+		changed = changed || propogatePointersHelper(block, ptrs, ++_tag, true);
 		blocks = blocks->next;
 	}
 	

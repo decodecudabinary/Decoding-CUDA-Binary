@@ -2238,10 +2238,8 @@ void finishParsing() {
 	bool notDone = true;
 	while(notDone) {
 		notDone = false;
-		notDone = notDone || propogatePrebreaks();
-		notDone = notDone || propogatePrecontinues();
+		notDone = notDone || propogatePointers();
 		notDone = notDone || propogateCallReturns();
-		notDone = notDone || propogateSSY();
 	}
 	
 	//Prepare addressing, in case it needs to be fixed later:

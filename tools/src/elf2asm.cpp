@@ -114,17 +114,18 @@ int main(int argc, char ** argv) {
 			}
 		}
 	#else
-		sys = "cuobjdump --version | grep -E \"release [0-9]\\.[0-9]\" | sed -r \"s/.*release ([0-9]\\.[0-9]).*/\\1/\"";
+		sys = "cuobjdump --version | grep -E \"release [0-9]+\\.[0-9]\" | sed -r \"s/.*release ([0-9]+)\\.([0-9]).*/\\1\\2/\"";
 		sass = popen(sys.c_str(), "r");
 		fgets(line, 512, sass);
 		vers = line;
 	#endif
+	char *pos;
+	if ((pos=strchr(vers, '\n')) != NULL)
+	    *pos = '\0';
 	if(!vers || vers[0] < '0' || vers[0] > '9') {
-		cerr << "FATAL ERROR e2a~151: Unable to determine cuobjdump version.\n";
+		cerr << "FATAL ERROR e2a~151: Unable to get cuobjdump version.\n";
 		exit(0);
 	}
-	vers[1] = vers[2];
-	vers[2] = 0;
 	pclose(sass);
 	
 	//Prepare cuobjdump output for reading:

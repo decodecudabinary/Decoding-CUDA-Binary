@@ -26,12 +26,14 @@ DECODEOBJS = objs/decode.tab.o \
 ifeq ($(OS),Windows_NT)
 	rm = @del
 	CFLAGS += -D WINDOWS
+	MKDIR_FLAGS = ""
 
 	cuobjdump_location := $(shell where cuobjdump)
 	ifneq ($(cuobjdump_location),)
 		CFLAGS += -D HAS_CUOBJDUMP
 	endif
 else
+	MKDIR_FLAGS = -p
 	UNAME_S := $(shell uname -s)
 	UNAME_P := $(shell uname -p)
 
@@ -51,10 +53,13 @@ else
 	endif
 endif
 
-default:$(shell mkdir -p "objs") bin2asm asm2bin decode
+default: objs bin2asm asm2bin decode
 
 debug: CFLAGS += -g -O0
 debug: default
+
+objs: 
+	@mkdir ${MKDIR_FLAGS} "objs"
 
 objs/asm2bin.yy.o: src/asm2bin.l src/common.hpp
 	${LEXER} -oobjs/asm2bin.yy.c src/asm2bin.l 
